@@ -129,10 +129,11 @@ Output JSON shape:
 
 def parse_alert_to_json(text: str) -> Dict[str,Any]:
     resp = client.chat.completions.create(
-        model="gpt-5-think",  # alias for this assistant
-        messages=[{"role":"system","content":EXTRACT_SYSTEM},{"role":"user","content":text}],
-        temperature=0
-    )
+    model="gpt-4o-mini",   # or "gpt-4o", "gpt-4.1-mini", "o3-mini"
+    messages=[{"role":"system","content":EXTRACT_SYSTEM},{"role":"user","content":text}],
+    temperature=0
+)
+
     raw = resp.choices[0].message.content.strip()
     return json.loads(raw)
 
