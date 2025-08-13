@@ -1,10 +1,11 @@
 # bot.py
-# Discord → GPT parser → Live Tradier data triggers → Sandbox orders → Google Sheets logging
-# Quick actions: Close All, Close 25%, SL→BE
+# Discord → GPT parser → Live Tradier (data) → Sandbox orders → Google Sheets
+# Tabs: ActiveTrades (live), Trades (history), Partials, Signals
+# Features: Restart-safe, Extended-hours stock entries, Quick actions
 
 import os, json, time, math, asyncio, requests, traceback
-from datetime import datetime
-from typing import Dict, Any, List, Optional
+from datetime import datetime, time as dtime
+from typing import Dict, Any, List, Optional, Tuple
 
 import discord
 from discord.ext import commands
@@ -14,7 +15,7 @@ from openai import OpenAI
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
 
-# ---------------- ENV & CONSTANTS ----------------
+# --------------- ENV & CONSTANTS ---------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -25,9 +26,10 @@ TRADIER_SANDBOX_ACCOUNT_ID = os.getenv("TRADIER_SANDBOX_ACCOUNT_ID")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON_TEXT = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_TEXT")
 
-TRADES_TAB   = os.getenv("TRADES_TAB", "Trades")
-PARTIALS_TAB = os.getenv("PARTIALS_TAB", "Partials")
-SIGNALS_TAB  = os.getenv("SIGNALS_TAB", "Signals")
+TRADES_TAB        = os.getenv("TRADES_TAB", "Trades")
+PARTIALS_TAB      = os.getenv("PARTIALS_TAB", "Partials")
+SIGNALS_TAB       = os.getenv("SIGNALS_TAB", "Signals")
+ACTIVE_TRADES_TAB = os.getenv("ACTIVE_TRADES_TAB", "ActiveTrades")
 
 TRADIER_LIVE = "https://api.tradier.com"
 TRADIER_SANDBOX = "https://sandbox.tradier.com"
@@ -35,19 +37,59 @@ TRADIER_SANDBOX = "https://sandbox.tradier.com"
 MODEL_PRIMARY = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MODEL_FALLBACK = os.getenv("OPENAI_MODEL_FALLBACK", "gpt-4.1-mini")
 
+# Extended-hours config (for STOCKS)
+EXTENDED_STOCK_ENABLED = os.getenv("EXTENDED_STOCK_ENABLED", "false").lower() in ("1","true","yes")
+EXTENDED_LIMIT_SLIPPAGE_BPS = float(os.getenv("EXTENDED_LIMIT_SLIPPAGE_BPS", "10"))  # 10 bps = 0.10%
+
 # Timeframes (seconds)
-TF_SECONDS = {"1m":60,"3m":180,"5m":300,"15m":900,"1h":3600,"4h":14400,"1d":86400}
+TF_SECONDS = {"1m":60, "3m":180, "5m":300, "15m":900, "1h":3600, "4h":14400, "1d":86400}
+ALLOWED_TFS = set(TF_SECONDS.keys())
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# ---------------- GOOGLE SHEETS HELPERS ----------------
-def sheets_service():
+# --------------- TIMEZONE / SESSION ---------------
+try:
+    import zoneinfo
+    NY = zoneinfo.ZoneInfo("America/New_York")
+except Exception:
+    NY = None  # fallback: treat all as RTH if zoneinfo missing
+
+def now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+def now_ny() -> datetime:
+    return datetime.now(tz=NY) if NY else datetime.utcnow()
+
+def market_session_ny(dt: Optional[datetime]=None) -> str:
+    """
+    'pre' (07:00-09:24), 'rth' (09:30-16:00), 'post' (16:00-19:55), 'closed'
+    Mon-Fri only.
+    """
+    dt = dt or now_ny()
+    if NY is None:
+        return "rth"
+    if dt.weekday() >= 5:  # Sat/Sun
+        return "closed"
+    t = dt.time()
+    if dtime(7,0) <= t <= dtime(9,24):
+        return "pre"
+    if dtime(9,30) <= t <= dtime(16,0):
+        return "rth"
+    if dtime(16,0) <= t <= dtime(19,55):
+        return "post"
+    return "closed"
+
+# --------------- GOOGLE SHEETS HELPERS ---------------
+def sheets_root():
     if not GOOGLE_SERVICE_ACCOUNT_JSON_TEXT:
         raise RuntimeError("Set GOOGLE_SERVICE_ACCOUNT_JSON_TEXT to the raw JSON of your service account.")
     if not GOOGLE_SHEET_ID:
-        raise RuntimeError("Set GOOGLE_SHEET_ID to your Google Sheet ID (string between /d/ and /edit).")
+        raise RuntimeError("Set GOOGLE_SHEET_ID to the Sheet ID (between /d/ and /edit).")
     info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON_TEXT)
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-    return build("sheets", "v4", credentials=creds).spreadsheets()
+    return build("sheets", "v4", credentials=creds)
+
+def sheets_service():
+    return sheets_root().spreadsheets()
 
 def gs_append(tab, values):
     sp = sheets_service()
@@ -59,24 +101,27 @@ def gs_append(tab, values):
         body={"values":[values]}
     ).execute()
 
-def gs_get_header(tab):
+def gs_get_header(tab) -> List[str]:
     sp = sheets_service()
     v = sp.values().get(spreadsheetId=GOOGLE_SHEET_ID, range=f"{tab}!A1:Z1").execute().get("values", [[]])[0]
     return v
 
-def gs_find_row(tab, key_col_name, key_val):
+def gs_get_rows(tab, start_row=2, end_col="Z") -> List[List[str]]:
     sp = sheets_service()
+    return sp.values().get(spreadsheetId=GOOGLE_SHEET_ID, range=f"{tab}!A{start_row}:{end_col}").execute().get("values", [])
+
+def gs_find_row(tab, key_col_name, key_val) -> Tuple[Optional[int], List[str]]:
     header = gs_get_header(tab)
     if key_col_name not in header:
         raise RuntimeError(f"Header '{key_col_name}' not found in {tab}")
     col_idx = header.index(key_col_name)
-    rows = sp.values().get(spreadsheetId=GOOGLE_SHEET_ID, range=f"{tab}!A2:Z2000").execute().get("values", [])
+    rows = gs_get_rows(tab)
     for i, row in enumerate(rows, start=2):
         if len(row) > col_idx and row[col_idx] == key_val:
             return i, header
     return None, header
 
-def gs_read_row(tab, rownum, endcol="T"):
+def gs_read_row(tab, rownum, endcol="Z"):
     sp = sheets_service()
     return sp.values().get(spreadsheetId=GOOGLE_SHEET_ID, range=f"{tab}!A{rownum}:{endcol}{rownum}").execute().get("values", [[]])[0]
 
@@ -89,26 +134,39 @@ def gs_update_row(tab, rownum, values):
         body={"values":[values]}
     ).execute()
 
-def append_trade(trade: Dict[str, Any]):
+def gs_delete_row(tab, rownum):
+    root = sheets_root()
+    meta = root.spreadsheets().get(spreadsheetId=GOOGLE_SHEET_ID).execute()
+    sheet_id = None
+    for sh in meta.get("sheets", []):
+        if sh.get("properties", {}).get("title") == tab:
+            sheet_id = sh.get("properties", {}).get("sheetId"); break
+    if sheet_id is None:
+        raise RuntimeError(f"Sheet tab '{tab}' not found to delete row.")
+    body = {"requests":[{"deleteDimension":{"range":{"sheetId": sheet_id,"dimension":"ROWS","startIndex": rownum-1,"endIndex": rownum}}}]}
+    root.spreadsheets().batchUpdate(spreadsheetId=GOOGLE_SHEET_ID, body=body).execute()
+
+# --------------- SHEET LOGGING ---------------
+def append_trade_history(trade: Dict[str, Any]):
     # Trades columns:
     # trade_id | source | ticker | asset_type | side | contract | qty_total | status | entry_rule | stop_rule | tp_rules
     # | entry_time | entry_price | underlying_at_entry | close_time | close_price | underlying_at_close | realized_pnl_$ | realized_pnl_% | notes
     row = [
-        trade.get("trade_id",""), trade.get("source",""), trade.get("ticker",""),
+        trade.get("trade_id",""), trade.get("source","Discord"), trade.get("ticker",""),
         trade.get("asset_type",""), trade.get("side",""), trade.get("contract",""),
         trade.get("qty_total",""), trade.get("status","waiting_confirm"),
         trade.get("entry_rule",""), trade.get("stop_rule",""), trade.get("tp_rules",""),
         trade.get("entry_time",""), trade.get("entry_price",""),
         trade.get("underlying_at_entry",""), trade.get("close_time",""),
         trade.get("close_price",""), trade.get("underlying_at_close",""),
-        "", "", trade.get("notes","")
+        trade.get("realized_pnl_$",""), trade.get("realized_pnl_%",""), trade.get("notes","")
     ]
     gs_append(TRADES_TAB, row)
 
-def update_trade(trade_id: str, updates: Dict[str, Any]):
+def update_trade_history(trade_id: str, updates: Dict[str, Any]):
     rownum, header = gs_find_row(TRADES_TAB,"trade_id",trade_id)
-    if not rownum: raise ValueError("Trade not found")
-    cur = gs_read_row(TRADES_TAB, rownum, endcol="T")
+    if not rownum: return
+    cur = gs_read_row(TRADES_TAB, rownum, endcol="Z")
     cur += [""] * (len(header)-len(cur))
     for k,v in updates.items():
         if k in header:
@@ -135,6 +193,7 @@ def append_partial(partial: Dict[str,Any]):
     gs_append(PARTIALS_TAB, row)
 
 def append_signal(sig: Dict[str,Any]):
+    # Signals: signal_id | received_at | raw_text | parsed_json
     row = [
         sig.get("signal_id",""),
         sig.get("received_at",""),
@@ -143,7 +202,56 @@ def append_signal(sig: Dict[str,Any]):
     ]
     gs_append(SIGNALS_TAB, row)
 
-# ---------------- OPENAI (GPT) ----------------
+def append_active_trade(trade_id: str, parsed: Dict[str,Any], qty: int, status: str="waiting"):
+    # ActiveTrades columns recommended:
+    # trade_id | ticker | side | qty | entry_tf | entry_cond | entry_level | stop_tf | stop_cond | stop_level | tps_json | notes | started_at
+    stop_tf = parsed["stop"]["tf"] if parsed["stop"]["tf"]!="same_as_entry" else parsed["entry"]["tf"]
+    row = [
+        trade_id,
+        parsed.get("ticker",""),
+        parsed.get("side",""),
+        str(qty),
+        parsed["entry"]["tf"],
+        parsed["entry"]["cond"],
+        str(parsed["entry"]["level"]),
+        stop_tf,
+        parsed["stop"]["cond"],
+        str(parsed["stop"]["level"]),
+        json.dumps(parsed.get("tps", [])),
+        parsed.get("notes",""),
+        now_iso(),
+    ]
+    gs_append(ACTIVE_TRADES_TAB, row)
+
+def read_active_trades() -> List[Dict[str,Any]]:
+    rows = gs_get_rows(ACTIVE_TRADES_TAB)
+    header = gs_get_header(ACTIVE_TRADES_TAB)
+    idx = {name:i for i,name in enumerate(header)}
+    out=[]
+    for r in rows:
+        try:
+            trade = {
+                "trade_id": r[idx.get("trade_id",0)],
+                "ticker": r[idx.get("ticker",1)].upper(),
+                "side": r[idx.get("side",2)],
+                "quantity": int(r[idx.get("qty",3)]),
+                "entry": {"tf": r[idx.get("entry_tf",4)], "cond": r[idx.get("entry_cond",5)], "level": float(r[idx.get("entry_level",6)])},
+                "stop":  {"tf": r[idx.get("stop_tf",7)],  "cond": r[idx.get("stop_cond",8)],  "level": float(r[idx.get("stop_level",9)])},
+                "tps": json.loads(r[idx.get("tps_json",10)] or "[]"),
+                "asset_type":"option",  # default; adjust if you add a column
+                "notes": r[idx.get("notes",11)] if len(r)>11 else "",
+            }
+            out.append(trade)
+        except Exception:
+            continue
+    return out
+
+def remove_active_trade(trade_id: str):
+    rownum, _ = gs_find_row(ACTIVE_TRADES_TAB, "trade_id", trade_id)
+    if rownum:
+        gs_delete_row(ACTIVE_TRADES_TAB, rownum)
+
+# --------------- OPENAI (GPT) ---------------
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 EXTRACT_SYSTEM = """You convert free-form trade alerts into strict JSON for automation.
@@ -179,22 +287,91 @@ def parse_alert_to_json(text: str) -> Dict[str,Any]:
     raw = resp.choices[0].message.content.strip()
     return json.loads(raw)
 
-# ---------------- TRADIER HELPERS ----------------
+# --------------- SANITIZATION ---------------
+def normalize_tf(tf: str) -> str:
+    tf = (tf or "").strip().lower()
+    return tf if tf in ALLOWED_TFS else "15m"
+
+def sanitize_parsed(p: Dict[str,Any]) -> Tuple[Optional[Dict[str,Any]], List[str]]:
+    warnings = []
+    if not isinstance(p, dict):
+        return None, ["Parser did not return JSON."]
+    # Ticker
+    t = (p.get("ticker") or "").strip().upper()
+    if not t:
+        return None, ["No ticker detected."]
+    p["ticker"] = t
+    # Entry
+    ent = p.get("entry",{}) or {}
+    ent["tf"] = normalize_tf(ent.get("tf"))
+    if ent.get("cond") not in {"close_above","close_below","touch_above","touch_below"}:
+        ent["cond"] = "close_above" if p.get("side","long")=="long" else "close_below"
+        warnings.append("Unsupported entry cond; default applied.")
+    try:
+        ent["level"] = float(ent.get("level"))
+    except Exception:
+        return None, ["Invalid entry level."]
+    p["entry"] = ent
+    # Stop
+    st = p.get("stop",{}) or {}
+    st_tf = st.get("tf")
+    st["tf"] = ent["tf"] if (not st_tf or st_tf=="same_as_entry") else normalize_tf(st_tf)
+    if st.get("cond") not in {"close_above","close_below","touch_above","touch_below"}:
+        st["cond"] = "close_below" if p.get("side","long")=="long" else "close_above"
+        warnings.append("Unsupported stop cond; default applied.")
+    try:
+        st["level"] = float(st.get("level"))
+    except Exception:
+        return None, ["Invalid stop level."]
+    p["stop"] = st
+    # Quantity
+    try:
+        p["quantity"] = int(p.get("quantity",1))
+    except Exception:
+        p["quantity"] = 1
+        warnings.append("Invalid quantity; defaulted to 1.")
+    # TPs
+    good_tps=[]
+    for tp in p.get("tps",[]):
+        trig = tp.get("trigger",{})
+        cond = trig.get("cond")
+        lvl = trig.get("level")
+        if cond not in {"touch_above","touch_below","close_above","close_below"}:
+            continue
+        try:
+            lvl = float(lvl)
+        except Exception:
+            continue
+        leg = {"trigger":{"cond":cond,"level":lvl}}
+        if "sell_qty" in tp:
+            leg["sell_qty"] = int(tp["sell_qty"])
+        elif "sell_pct" in tp:
+            leg["sell_pct"] = int(tp["sell_pct"])
+        else:
+            leg["sell_qty"] = 1
+        good_tps.append(leg)
+    p["tps"]=good_tps
+    return p, warnings
+
+# --------------- TRADIER HELPERS ---------------
 def live_quote(symbol: str) -> Optional[float]:
+    if not symbol:
+        return None
     h = {"Authorization": f"Bearer {TRADIER_LIVE_API_KEY}", "Accept":"application/json"}
     r = requests.get(f"{TRADIER_LIVE}/v1/markets/quotes", params={"symbols":symbol}, headers=h, timeout=10)
     r.raise_for_status()
     q = r.json().get("quotes",{}).get("quote",{})
     if not q: return None
-    return float(q.get("last", q.get("bid", 0)))
+    if isinstance(q, list) and q:
+        q = q[0]
+    return float(q.get("last") or q.get("bid") or 0)
 
 def get_option_chain(symbol: str, dte: int=14, greeks=True):
-    # MVP: pick first listed expiry; refine later to true nearest DTE
     h = {"Authorization": f"Bearer {TRADIER_LIVE_API_KEY}", "Accept":"application/json"}
     exp_resp = requests.get(f"{TRADIER_LIVE}/v1/markets/options/expirations",
                             params={"symbol":symbol,"includeAllRoots":"true"}, headers=h, timeout=10).json()
     exps = exp_resp.get("expirations",{}).get("date",[])
-    best = exps[0] if exps else None
+    best = exps[0] if exps else None  # TODO: compute true nearest DTE
     chain = requests.get(f"{TRADIER_LIVE}/v1/markets/options/chains",
                          params={"symbol":symbol,"expiration":best,"greeks":"true" if greeks else "false"},
                          headers=h, timeout=10).json()
@@ -215,17 +392,39 @@ def sandbox_place_option_order(occ_symbol: str, side: str, qty: int, order_type=
     data = {
         "class":"option",
         "symbol":occ_symbol,
-        "side":"buy_to_open",  # MVP: long options only
+        "side":"buy_to_open",  # MVP: long only
         "quantity": qty,
         "type": order_type,
         "duration":"day"
     }
-    if limit_price: data["price"] = limit_price
+    if limit_price: data["price"] = f"{float(limit_price):.2f}"
     url = f"{TRADIER_SANDBOX}/v1/accounts/{TRADIER_SANDBOX_ACCOUNT_ID}/orders"
     r = requests.post(url, data=data, headers=h, timeout=15)
     return r.json()
 
-# ---------------- STATE ----------------
+def sandbox_place_equity_order(symbol: str, side: str, qty: int, last_price: float):
+    """
+    Stocks: RTH → MARKET/DAY; pre/post → LIMIT with duration=pre/post.
+    """
+    sess = market_session_ny()
+    if sess == "rth" or not EXTENDED_STOCK_ENABLED:
+        order_type = "market"; duration = "day"; price = None
+    elif sess in ("pre","post"):
+        order_type = "limit"; duration = "pre" if sess == "pre" else "post"
+        bump = (EXTENDED_LIMIT_SLIPPAGE_BPS / 10000.0) * last_price
+        price = (last_price + bump) if side.lower().startswith("buy") else (last_price - bump)
+        price = round(price, 2)
+    else:
+        raise RuntimeError("Market closed (no pre/post). Try during pre, RTH, or post.")
+
+    h = {"Authorization": f"Bearer {TRADIER_SANDBOX_API_KEY}", "Accept":"application/json"}
+    data = {"class":"equity","symbol":symbol,"side":side,"quantity":qty,"type":order_type,"duration":duration}
+    if price is not None: data["price"] = f"{price:.2f}"
+    url = f"{TRADIER_SANDBOX}/v1/accounts/{TRADIER_SANDBOX_ACCOUNT_ID}/orders"
+    r = requests.post(url, data=data, headers=h, timeout=15)
+    return r.json()
+
+# --------------- STATE ---------------
 class PositionStore:
     def __init__(self): self.state: Dict[str,Dict[str,Any]] = {}
     def add(self, tid:str, rec:Dict[str,Any]): self.state[tid]=rec
@@ -235,9 +434,8 @@ class PositionStore:
         if tid in self.state: self.state[tid][key]=val
 
 positions = PositionStore()
-def now_iso(): return datetime.utcnow().isoformat(timespec="seconds")+"Z"
 
-# ---------------- DISCORD BOT ----------------
+# --------------- DISCORD BOT ---------------
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -272,6 +470,15 @@ async def on_ready():
         print(f"Slash commands synced: {len(synced)}")
     except Exception as e:
         print("Slash sync error:", e)
+    # Restart-safe: reload active trades
+    try:
+        active = read_active_trades()
+        for rec in active:
+            tid = rec["trade_id"]
+            asyncio.create_task(safe_watch(tid, rec, None))
+        print(f"Reloaded {len(active)} active trade(s) from {ACTIVE_TRADES_TAB}.")
+    except Exception as e:
+        print("ActiveTrades reload error:", e)
 
 # Slash: /positions
 @bot.tree.command(name="positions", description="Show active positions")
@@ -305,8 +512,7 @@ async def show_positions(ctx_or_inter):
         else:
             await ctx_or_inter.send(msg)
         return
-    lines=[]
-    last_tid=None
+    lines=[]; last_tid=None
     for tid, rec in active.items():
         last_tid = tid
         lines.append(
@@ -335,8 +541,9 @@ async def closeall(ctx, trade_id: str, confirm: str = ""):
         "realized_pnl_$":"", "notes":""
     })
     positions.set(trade_id,"remaining_qty",0)
-    update_trade(trade_id, {"status":"closed","close_time":now_iso()})
-    await ctx.send(f"📕 **Trade Closed** — {rec['contract']} — qty {qty}")
+    update_trade_history(trade_id, {"status":"closed","close_time":now_iso()})
+    remove_active_trade(trade_id)
+    await ctx.send(f"📕 **Trade Closed** — qty {qty} — `{trade_id}`")
 
 @bot.command()
 async def close25(ctx, trade_id: str, confirm: str = ""):
@@ -353,8 +560,8 @@ async def close25(ctx, trade_id: str, confirm: str = ""):
         "realized_pnl_$":"", "notes":""
     })
     positions.set(trade_id,"remaining_qty",qty - slice_qty)
-    update_trade(trade_id, {"status":"tp_partial"})
-    await ctx.send(f"🎯 **Closed 25%** — {rec['contract']} — {slice_qty} contracts. Remaining {qty - slice_qty}.")
+    update_trade_history(trade_id, {"status":"tp_partial"})
+    await ctx.send(f"🎯 **Closed 25%** — {slice_qty} — Remaining {qty - slice_qty} — `{trade_id}`")
 
 @bot.command()
 async def moveSLBE(ctx, trade_id: str, confirm: str = ""):
@@ -363,10 +570,19 @@ async def moveSLBE(ctx, trade_id: str, confirm: str = ""):
     if not rec: return await ctx.send("Trade not found.")
     be_desc = f"BE @ underlying {rec.get('underlying_at_entry',0):.2f}"
     positions.set(trade_id,"stop_desc", be_desc)
-    update_trade(trade_id, {"stop_rule": be_desc, "notes":"SL→BE"})
-    await ctx.send(f"✏️ **SL moved to BE** — {rec['contract']} — {be_desc}")
+    update_trade_history(trade_id, {"stop_rule": be_desc, "notes":"SL→BE"})
+    await ctx.send(f"✏️ **SL moved to BE** — {be_desc} — `{trade_id}`")
 
-# ---------------- MESSAGE LISTENER: parse alerts ----------------
+# --------------- MESSAGE LISTENER ---------------
+async def safe_watch(trade_id, parsed, channel: Optional[discord.TextChannel]):
+    try:
+        await watch_and_execute(trade_id, parsed, channel)
+    except Exception as e:
+        if channel:
+            await channel.send(f"⚠️ Watcher stopped for `{trade_id}`: {e}")
+        else:
+            print(f"Watcher stopped for {trade_id}: {e}")
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot: return
@@ -375,25 +591,30 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
     if content.startswith("!"): return
 
-    # Parse plain English → JSON
+    # Parse → JSON
     try:
-        parsed = parse_alert_to_json(content)
+        raw = parse_alert_to_json(content)
     except Exception as e:
         return await message.channel.send(f"⚠️ Parse error: {e}")
 
-    # Log raw signal
+    parsed, warns = sanitize_parsed(raw)
+    if not parsed:
+        return await message.channel.send("⚠️ Signal ignored: missing/invalid trade details (ticker/levels).")
+
+    # Log signal
     sig_id = f"sig-{int(time.time())}"
     append_signal({"signal_id":sig_id,"received_at":now_iso(),"raw_text":content,"parsed_json":parsed})
+    if warns:
+        await message.channel.send("ℹ️ " + " | ".join(warns))
 
-    # Build parent trade
-    ticker = parsed["ticker"].upper()
+    # Build history row
+    ticker = parsed["ticker"]
     entry_rule = f"{parsed['entry']['tf']} {parsed['entry']['cond']} {parsed['entry']['level']}"
-    stop_tf = parsed['stop']['tf'] if parsed['stop']['tf']!="same_as_entry" else parsed['entry']['tf']
-    stop_rule = f"{stop_tf} {parsed['stop']['cond']} {parsed['stop']['level']}"
-    tp_rules = ", ".join([f"{'qty '+str(tp.get('sell_qty')) if 'sell_qty' in tp else ('pct '+str(tp.get('sell_pct')))} @ {tp['trigger']['level']}" for tp in parsed.get('tps',[]) if tp.get('trigger')])
+    stop_rule  = f"{parsed['stop']['tf']} {parsed['stop']['cond']} {parsed['stop']['level']}"
+    tp_rules   = ", ".join([f"{('qty '+str(tp.get('sell_qty')) if 'sell_qty' in tp else ('pct '+str(tp.get('sell_pct'))))} @ {tp['trigger']['level']}" for tp in parsed.get('tps',[])])
 
     trade_id = f"{ticker}-{datetime.utcnow().strftime('%Y%m%d')}-{int(time.time())%100000:05d}"
-    append_trade({
+    append_trade_history({
         "trade_id": trade_id, "source":"Discord", "ticker":ticker,
         "asset_type": parsed.get("asset_type","option"),
         "side": parsed.get("side","long"),
@@ -401,32 +622,41 @@ async def on_message(message: discord.Message):
         "status":"waiting_confirm", "entry_rule": entry_rule, "stop_rule": stop_rule,
         "tp_rules": tp_rules, "notes": parsed.get("notes","")
     })
-    await message.channel.send(f"📥 Signal queued `{trade_id}` for {ticker}. Watching for {entry_rule} (RTH).")
+    append_active_trade(trade_id, parsed, qty=int(parsed.get("quantity",1)), status="waiting")
+    await message.channel.send(f"📥 Signal queued `{trade_id}` for {ticker}. Watching for {entry_rule}.")
 
-    # Spawn watcher
-    asyncio.create_task(watch_and_execute(trade_id, parsed, message.channel))
+    asyncio.create_task(safe_watch(trade_id, parsed, message.channel))
 
-# ---------------- WATCHERS ----------------
+# --------------- WATCHERS ---------------
 def _tf_seconds(tf: str) -> int:
-    if tf not in TF_SECONDS: raise ValueError(f"Unsupported timeframe: {tf}")
-    return TF_SECONDS[tf]
+    return TF_SECONDS.get(tf, TF_SECONDS["15m"])
 
-async def watch_and_execute(trade_id: str, parsed: Dict[str,Any], channel: discord.TextChannel):
+async def watch_and_execute(trade_id: str, parsed: Dict[str,Any], channel: Optional[discord.TextChannel]):
     ticker = parsed["ticker"].upper()
     tf = parsed["entry"]["tf"]
     tf_sec = _tf_seconds(tf)
     level = float(parsed["entry"]["level"])
     cond = parsed["entry"]["cond"]
 
+    if not ticker:
+        if channel: await channel.send("⚠️ Aborting: empty ticker.")
+        remove_active_trade(trade_id); return
+
     cur_bucket=None; o=h=l=c=None
     bucket = lambda ts: int(ts//tf_sec)*tf_sec
 
     while True:
-        last = live_quote(ticker)
+        try:
+            last = live_quote(ticker)
+        except Exception as e:
+            if channel: await channel.send(f"⚠️ Quote error for {ticker}: {e}")
+            await asyncio.sleep(2); continue
+
         if last is None:
             await asyncio.sleep(1); continue
-        now = time.time()
-        b = bucket(now)
+
+        now_ts = time.time()
+        b = bucket(now_ts)
         if cur_bucket != b:
             if cur_bucket is not None and c is not None:
                 trigger = (cond=="close_above" and c > level) or (cond=="close_below" and c < level)
@@ -438,55 +668,19 @@ async def watch_and_execute(trade_id: str, parsed: Dict[str,Any], channel: disco
             h=max(h,last); l=min(l,last); c=last
         await asyncio.sleep(1)
 
-def get_option_chain(symbol: str, dte: int=14, greeks=True):
-    h = {"Authorization": f"Bearer {TRADIER_LIVE_API_KEY}", "Accept":"application/json"}
-    exp_resp = requests.get(f"{TRADIER_LIVE}/v1/markets/options/expirations",
-                            params={"symbol":symbol,"includeAllRoots":"true"}, headers=h, timeout=10).json()
-    exps = exp_resp.get("expirations",{}).get("date",[])
-    best = exps[0] if exps else None
-    chain = requests.get(f"{TRADIER_LIVE}/v1/markets/options/chains",
-                         params={"symbol":symbol,"expiration":best,"greeks":"true" if greeks else "false"},
-                         headers=h, timeout=10).json()
-    return chain.get("options",{}).get("option",[]), best
-
-def pick_contract(chain: List[Dict[str,Any]], side: str, target_delta: float=0.5, strike: Optional[float]=None, typ: str="auto"):
-    if typ=="auto":
-        typ = "call" if side=="long" else "put"
-    candidates = [c for c in chain if c.get("option_type")==typ]
-    if not candidates:
-        raise RuntimeError("No matching option_type candidates in chain.")
-    if strike is not None:
-        return min(candidates, key=lambda c: abs(float(c["strike"])-float(strike)))
-    return min(candidates, key=lambda c: abs(abs(float(c.get("delta",0))) - float(target_delta)))
-
-def sandbox_place_option_order(occ_symbol: str, side: str, qty: int, order_type="market", limit_price=None):
-    h = {"Authorization": f"Bearer {TRADIER_SANDBOX_API_KEY}", "Accept":"application/json"}
-    data = {
-        "class":"option",
-        "symbol":occ_symbol,
-        "side":"buy_to_open",
-        "quantity": qty,
-        "type": order_type,
-        "duration":"day"
-    }
-    if limit_price: data["price"] = limit_price
-    url = f"{TRADIER_SANDBOX}/v1/accounts/{TRADIER_SANDBOX_ACCOUNT_ID}/orders"
-    r = requests.post(url, data=data, headers=h, timeout=15)
-    return r.json()
-
-async def place_entry_and_manage(trade_id:str, parsed:Dict[str,Any], channel: discord.TextChannel):
+async def place_entry_and_manage(trade_id:str, parsed:Dict[str,Any], channel: Optional[discord.TextChannel]):
     ticker = parsed["ticker"].upper()
     qty = int(parsed.get("quantity",1))
     side = parsed.get("side","long")
     asset_type = parsed.get("asset_type","option")
 
     contract_desc = ""
-    fill_premium = None
     underlying_now = live_quote(ticker) or 0.0
 
     if asset_type == "stock":
         contract_desc = f"{ticker} shares"
-        # TODO: implement stock order via sandbox if needed
+        eq_side = "buy" if side == "long" else "sell_short"
+        _ = sandbox_place_equity_order(ticker, eq_side, qty, float(underlying_now))
     else:
         chain, expiry = get_option_chain(ticker, dte=parsed.get("option_select",{}).get("dte",14))
         sel = pick_contract(
@@ -500,29 +694,29 @@ async def place_entry_and_manage(trade_id:str, parsed:Dict[str,Any], channel: di
         contract_desc = f"{ticker} {expiry} {sel['strike']}{sel['option_type'][0].upper()} (Δ {float(sel.get('delta',0)):.2f})"
         _ = sandbox_place_option_order(occ, side, qty, order_type="market")
 
+    # track in memory + history
     positions.add(trade_id,{
         "contract": contract_desc,
         "remaining_qty": qty,
-        "avg_entry_premium": fill_premium or 0.0,
+        "avg_entry_premium": 0.0,
         "underlying_at_entry": underlying_now,
-        "stop_desc": f"{parsed['stop']['tf'] if parsed['stop']['tf']!='same_as_entry' else parsed['entry']['tf']} {parsed['stop']['cond']} {parsed['stop']['level']}",
+        "stop_desc": f"{parsed['stop']['tf']} {parsed['stop']['cond']} {parsed['stop']['level']}",
         "tp_desc": ", ".join([str(tp['trigger']['level']) for tp in parsed.get('tps',[])]),
         "status":"active"
     })
-    update_trade(trade_id, {
+    update_trade_history(trade_id, {
         "status":"active","entry_time": now_iso(),
         "contract": contract_desc, "underlying_at_entry": f"{underlying_now:.2f}"
     })
-    await channel.send(f"✅ **Trade Opened** — {contract_desc}\nQty: {qty} (Market) | Trade ID: `{trade_id}`",
-                       view=ActionView(trade_id))
+    if channel:
+        await channel.send(f"✅ **Trade Opened** — {contract_desc}\nQty: {qty} | Trade ID: `{trade_id}`", view=ActionView(trade_id))
 
     asyncio.create_task(tp_sl_manager(trade_id, parsed, channel))
 
-async def tp_sl_manager(trade_id:str, parsed:Dict[str,Any], channel: discord.TextChannel):
+async def tp_sl_manager(trade_id:str, parsed:Dict[str,Any], channel: Optional[discord.TextChannel]):
     ticker = parsed["ticker"].upper()
-    tf = parsed["entry"]["tf"]; tf_sec = TF_SECONDS[tf]
+    tf = parsed["entry"]["tf"]; tf_sec = _tf_seconds(tf)
 
-    stop_tf = parsed["stop"]["tf"] if parsed["stop"]["tf"]!="same_as_entry" else tf
     stop_level = float(parsed["stop"]["level"]); stop_cond = parsed["stop"]["cond"]
 
     cur_bucket=None; o=h=l=c=None
@@ -534,10 +728,11 @@ async def tp_sl_manager(trade_id:str, parsed:Dict[str,Any], channel: discord.Tex
         if last is None:
             await asyncio.sleep(1); continue
 
-        # TP (touch on underlying)
         rec = positions.get(trade_id)
         if not rec: return
         remaining = int(rec["remaining_qty"])
+
+        # TP: touch-based on underlying
         for tp in list(tps):
             lvl = float(tp["trigger"]["level"]); cond = tp["trigger"]["cond"]
             touch = (cond.endswith("above") and last >= lvl) or (cond.endswith("below") and last <= lvl)
@@ -554,11 +749,13 @@ async def tp_sl_manager(trade_id:str, parsed:Dict[str,Any], channel: discord.Tex
                     "target_label": f"TP @ {lvl}", "reason":"touch",
                     "commission_fee":"", "realized_pnl_$":"", "notes":""
                 })
-                await channel.send(f"🎯 **TP Hit** — {slice_qty} closed @ underlying {last:.2f} — Remaining {remaining} — `{trade_id}`")
+                if channel:
+                    await channel.send(f"🎯 **TP Hit** — {slice_qty} closed @ underlying {last:.2f} — Remaining {remaining} — `{trade_id}`")
                 tps.remove(tp)
                 if remaining<=0:
-                    update_trade(trade_id, {"status":"closed","close_time":now_iso(),"underlying_at_close":f"{last:.2f}"})
-                    await channel.send(f"📕 **Trade Closed** — `{trade_id}` fully exited.")
+                    update_trade_history(trade_id, {"status":"closed","close_time":now_iso(),"underlying_at_close":f"{last:.2f}"})
+                    remove_active_trade(trade_id)
+                    if channel: await channel.send(f"📕 **Trade Closed** — `{trade_id}` fully exited.")
                     return
 
         # SL on timeframe close
@@ -576,15 +773,16 @@ async def tp_sl_manager(trade_id:str, parsed:Dict[str,Any], channel: discord.Tex
                         "commission_fee":"", "realized_pnl_$":"", "notes":""
                     })
                     positions.set(trade_id,"remaining_qty",0)
-                    update_trade(trade_id, {"status":"stopped","close_time":now_iso(),"underlying_at_close":f"{c:.2f}"})
-                    await channel.send(f"🛑 **Stop Hit** — closed {slice_qty} @ underlying {c:.2f} — `{trade_id}`")
+                    update_trade_history(trade_id, {"status":"stopped","close_time":now_iso(),"underlying_at_close":f"{c:.2f}"})
+                    remove_active_trade(trade_id)
+                    if channel: await channel.send(f"🛑 **Stop Hit** — closed {slice_qty} @ underlying {c:.2f} — `{trade_id}`")
                     return
             cur_bucket=b; o=h=l=c=last
         else:
             h=max(h,last); l=min(l,last); c=last
         await asyncio.sleep(1)
 
-# ---------------- MAIN ----------------
+# --------------- MAIN ---------------
 def require_env(k):
     if not os.getenv(k):
         raise SystemExit(f"Missing required env var: {k}")
