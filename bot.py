@@ -1,7 +1,13 @@
-# bot.py
-# Discord → GPT parser → Live Tradier (data) → Sandbox orders → Google Sheets
-# Tabs: ActiveTrades (live), Trades (history), Partials, Signals
-# Features: Restart-safe, Extended-hours stock entries, Quick intents, Close intents, Discord confirmations
+# bot.py (final)
+# Discord ↔ GPT Orchestrator ↔ Tradier (live data) / Tradier Sandbox (orders)
+# Google Sheets logging (Signals, Trades, Partials, ActiveTrades)
+# Features:
+# - Quick intents: stocks & options (RTH/ETH), closes (qty/%/limit)
+# - Multi‑turn GPT tool-calling: show positions/orders, filter by expiry/week, close exact OCCs
+# - Confirmation flow for "close at X% profit" etc. (type CONFIRM to execute)
+# - Extended-hours stock orders with limit + slippage bps
+# - ActiveTrades tracks OCC, strike, expiry; SL→BE updates
+# - Positions view that shows ONLY Tradier (per your request)
 
 import os, json, time, math, asyncio, requests, traceback, re
 from datetime import datetime, time as dtime
@@ -15,7 +21,7 @@ from openai import OpenAI
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
 
-# --------------- ENV & CONSTANTS ---------------
+# ---------------- ENV & CONSTANTS ----------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -37,24 +43,27 @@ TRADIER_SANDBOX = "https://sandbox.tradier.com"
 MODEL_PRIMARY = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MODEL_FALLBACK = os.getenv("OPENAI_MODEL_FALLBACK", "gpt-4.1-mini")
 
-# Extended-hours config (for STOCKS)
-# Support both spellings, prefer ENABLED if present
-_EXTENDED_ENABLE_A = os.getenv("EXTENDED_STOCK_ENABLED")
-_EXTENDED_ENABLE_B = os.getenv("EXTENDED_STOCK_ENABLE")
-EXTENDED_STOCK_ENABLED = ( (_EXTENDED_ENABLE_A or _EXTENDED_ENABLE_B or "false").lower() in ("1","true","yes") )
+# Extended-hours STOCKS
+EXTENDED_STOCK_ENABLE = os.getenv("EXTENDED_STOCK_ENABLE")
+if EXTENDED_STOCK_ENABLE is None:
+    EXTENDED_STOCK_ENABLE = os.getenv("EXTENDED_STOCK_ENABLED", "false")
+EXTENDED_STOCK_ENABLED = EXTENDED_STOCK_ENABLE.lower() in ("1","true","yes")
 EXTENDED_LIMIT_SLIPPAGE_BPS = float(os.getenv("EXTENDED_LIMIT_SLIPPAGE_BPS", "10"))  # 10 bps = 0.10%
 
 # Timeframes (seconds)
-TF_SECONDS = {"1m":60, "3m":180, "5m":300, "15m":900, "1h":3600, "4h":14400, "1d":86400}
+TF_SECONDS = {"1m":60,"3m":180,"5m":300,"15m":900,"1h":3600,"4h":14400,"1d":86400}
 ALLOWED_TFS = set(TF_SECONDS.keys())
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# --------------- TIMEZONE / SESSION ---------------
+# Pending confirmation actions (per-channel)
+PENDING_ACTIONS: Dict[str, Dict[str, Any]] = {}
+
+# ---------------- TIMEZONE / SESSION ----------------
 try:
     import zoneinfo
     NY = zoneinfo.ZoneInfo("America/New_York")
 except Exception:
-    NY = None  # fallback: treat as RTH-only if tz not available
+    NY = None
 
 def now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -64,8 +73,8 @@ def now_ny() -> datetime:
 
 def market_session_ny(dt: Optional[datetime]=None) -> str:
     """
-    'pre' (07:00-09:24), 'rth' (09:30-16:00), 'post' (16:00-19:55), 'closed'
-    Mon–Fri only.
+    Equity sessions: 'pre' (07:00-09:24 ET), 'rth' (09:30-16:00), 'post' (16:00-19:55), else 'closed'.
+    Mon–Fri only. If tz not available, return 'rth'.
     """
     dt = dt or now_ny()
     if NY is None:
@@ -81,12 +90,12 @@ def market_session_ny(dt: Optional[datetime]=None) -> str:
         return "post"
     return "closed"
 
-# --------------- GOOGLE SHEETS HELPERS ---------------
+# ---------------- GOOGLE SHEETS ----------------
 def sheets_root():
     if not GOOGLE_SERVICE_ACCOUNT_JSON_TEXT:
         raise RuntimeError("Set GOOGLE_SERVICE_ACCOUNT_JSON_TEXT to the raw JSON of your service account.")
     if not GOOGLE_SHEET_ID:
-        raise RuntimeError("Set GOOGLE_SHEET_ID to the Sheet ID (between /d/ and /edit).")
+        raise RuntimeError("Set GOOGLE_SHEET_ID to your Google Sheet ID.")
     info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON_TEXT)
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     return build("sheets", "v4", credentials=creds)
@@ -149,7 +158,7 @@ def gs_delete_row(tab, rownum):
     body = {"requests":[{"deleteDimension":{"range":{"sheetId": sheet_id,"dimension":"ROWS","startIndex": rownum-1,"endIndex": rownum}}}]}
     root.spreadsheets().batchUpdate(spreadsheetId=GOOGLE_SHEET_ID, body=body).execute()
 
-# --------------- SHEET LOGGING ---------------
+# ---------------- SHEET LOGGING ----------------
 def append_trade_history(trade: Dict[str, Any]):
     # Trades columns:
     # trade_id | source | ticker | asset_type | side | contract | qty_total | status | entry_rule | stop_rule | tp_rules
@@ -205,9 +214,9 @@ def append_signal(sig: Dict[str,Any]):
     ]
     gs_append(SIGNALS_TAB, row)
 
-def append_active_trade(trade_id: str, parsed: Dict[str,Any], qty: int, status: str="waiting"):
+def append_active_trade(trade_id: str, parsed: Dict[str,Any], qty: int, status: str="waiting", occ_symbol: str=None, strike: float=None, expiry: str=None):
     # ActiveTrades columns:
-    # trade_id | ticker | side | qty | entry_tf | entry_cond | entry_level | stop_tf | stop_cond | stop_level | tps_json | notes | started_at
+    # trade_id | ticker | side | qty | entry_tf | entry_cond | entry_level | stop_tf | stop_cond | stop_level | tps_json | notes | started_at | occ_symbol | strike | expiry
     stop_tf = parsed["stop"]["tf"] if parsed["stop"]["tf"]!="same_as_entry" else parsed["entry"]["tf"]
     row = [
         trade_id,
@@ -223,6 +232,9 @@ def append_active_trade(trade_id: str, parsed: Dict[str,Any], qty: int, status: 
         json.dumps(parsed.get("tps", [])),
         parsed.get("notes",""),
         now_iso(),
+        occ_symbol or "",
+        "" if strike is None else str(strike),
+        expiry or "",
     ]
     gs_append(ACTIVE_TRADES_TAB, row)
 
@@ -241,8 +253,11 @@ def read_active_trades() -> List[Dict[str,Any]]:
                 "entry": {"tf": r[idx.get("entry_tf",4)], "cond": r[idx.get("entry_cond",5)], "level": float(r[idx.get("entry_level",6)])},
                 "stop":  {"tf": r[idx.get("stop_tf",7)],  "cond": r[idx.get("stop_cond",8)],  "level": float(r[idx.get("stop_level",9)])},
                 "tps": json.loads(r[idx.get("tps_json",10)] or "[]"),
-                "asset_type":"option",  # default; command alerts can override
+                "asset_type":"option",
                 "notes": r[idx.get("notes",11)] if len(r)>11 else "",
+                "occ_symbol": r[idx.get("occ_symbol",13)] if len(r)>13 else "",
+                "strike": float(r[idx.get("strike",14)]) if len(r)>14 and r[idx.get("strike",14)] else None,
+                "expiry": r[idx.get("expiry",15)] if len(r)>15 else "",
             }
             out.append(trade)
         except Exception:
@@ -254,7 +269,7 @@ def remove_active_trade(trade_id: str):
     if rownum:
         gs_delete_row(ACTIVE_TRADES_TAB, rownum)
 
-# --------------- OPENAI (GPT) ---------------
+# ---------------- OPENAI (LLM PARSER) ----------------
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 EXTRACT_SYSTEM = """You convert free-form trade alerts into strict JSON for automation.
@@ -290,7 +305,132 @@ def parse_alert_to_json(text: str) -> Dict[str,Any]:
     raw = resp.choices[0].message.content.strip()
     return json.loads(raw)
 
-# --------------- SANITIZATION ---------------
+# ---------- GPT TOOL SCHEMA & ORCHESTRATOR ----------
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_positions",
+            "description": "Return current account positions; optionally filter by symbols",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbols": {"type": "array", "items": {"type": "string"}}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_orders",
+            "description": "Return working/pending orders; optionally filter by symbols",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbols": {"type": "array", "items": {"type": "string"}},
+                    "open_only": {"type": "boolean"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "close_options",
+            "description": "Close specific option positions by OCC symbol list",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "occ_symbols": {"type":"array","items":{"type":"string"}},
+                    "order_type": {"type":"string","enum":["market","limit"]},
+                    "limit": {"type":"number"}
+                },
+                "required": ["occ_symbols"]
+            }
+        }
+    },
+    {
+        "type":"function",
+        "function":{
+            "name":"get_positions_with_pl",
+            "description":"Return positions with avg, live, and pl_pct; optional symbol filter",
+            "parameters":{"type":"object","properties":{"symbols":{"type":"array","items":{"type":"string"}}}}
+        }
+    },
+    {
+        "type":"function",
+        "function":{
+            "name":"prepare_pending_close",
+            "description":"Stash a pending close request (occ list) for confirmation",
+            "parameters":{
+                "type":"object",
+                "properties":{
+                    "occ_symbols":{"type":"array","items":{"type":"string"}},
+                    "order_type":{"type":"string","enum":["market","limit"]},
+                    "limit":{"type":"number"},
+                    "channel_id":{"type":"string"}
+                },
+                "required":["occ_symbols","channel_id"]
+            }
+        }
+    }
+]
+
+ORCH_SYSTEM = """You are a trading orchestrator. Use tools to fetch data before acting.
+- Think step-by-step but reply to the user only after tools complete.
+- If user asks to close options by expiry/symbol/condition, first fetch positions, filter, then close exact OCCs.
+- Prefer market for closes unless user specifies limit.
+- For requests like 'close all positions at 50% profit':
+  1) call get_positions_with_pl (and/or get_positions)
+  2) filter pl_pct >= threshold,
+  3) summarize matches and call prepare_pending_close with the exact OCC symbols,
+  4) tell user to type CONFIRM to execute.
+- Keep responses concise and actionable."""
+
+def gpt_orchestrate(user_text: str, channel_id: str) -> str:
+    messages = [{"role":"system","content":ORCH_SYSTEM},
+                {"role":"user","content":user_text + f"\n\n[channel_id:{channel_id}]"}]
+    max_loops = 6
+    for _ in range(max_loops):
+        resp = client.chat.completions.create(
+            model=MODEL_PRIMARY,
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            temperature=0
+        )
+        msg = resp.choices[0].message
+        if getattr(msg, "tool_calls", None):
+            for call in msg.tool_calls:
+                name = call.function.name
+                args = json.loads(call.function.arguments or "{}")
+                if name == "get_positions":
+                    data = sandbox_list_positions_filtered(args.get("symbols"))
+                elif name == "get_orders":
+                    data = sandbox_list_orders_filtered(args.get("symbols"), open_only=args.get("open_only", True))
+                elif name == "close_options":
+                    data = close_options_occ(args["occ_symbols"], args.get("order_type","market"), args.get("limit"))
+                elif name == "get_positions_with_pl":
+                    data = sandbox_list_positions_detailed()
+                    syms = args.get("symbols")
+                    if syms:
+                        syms_set = set(s.upper() for s in syms)
+                        data = [d for d in data if d["underlying"] in syms_set]
+                elif name == "prepare_pending_close":
+                    occs = args["occ_symbols"]; order_type = args.get("order_type","market"); limit_px = args.get("limit")
+                    ch = str(args.get("channel_id", channel_id))
+                    PENDING_ACTIONS[ch] = {"ts": time.time(),"occ_symbols": occs,"order_type": order_type,"limit": limit_px}
+                    data = {"ok": True, "count": len(occs)}
+                else:
+                    data = {"ok": False, "error": "unknown_tool"}
+                messages.append({"role":"assistant","tool_calls":[call]})
+                messages.append({"role":"tool","tool_call_id":call.id,"name":name,"content":json.dumps(data)})
+            continue
+        return msg.content or "Done."
+    return "Timed out while orchestrating."
+
+# ---------------- SANITIZATION ----------------
 def normalize_tf(tf: str) -> str:
     tf = (tf or "").strip().lower()
     return tf if tf in ALLOWED_TFS else "15m"
@@ -308,8 +448,10 @@ def sanitize_parsed(p: Dict[str,Any]) -> Tuple[Optional[Dict[str,Any]], List[str
     if ent.get("cond") not in {"close_above","close_below","touch_above","touch_below"}:
         ent["cond"] = "close_above" if p.get("side","long")=="long" else "close_below"
         warnings.append("Unsupported entry cond; default applied.")
-    try: ent["level"] = float(ent.get("level"))
-    except Exception: return None, ["Invalid entry level."]
+    try:
+        ent["level"] = float(ent.get("level"))
+    except Exception:
+        return None, ["Invalid entry level."]
     p["entry"] = ent
     st = p.get("stop",{}) or {}
     st_tf = st.get("tf")
@@ -317,12 +459,16 @@ def sanitize_parsed(p: Dict[str,Any]) -> Tuple[Optional[Dict[str,Any]], List[str
     if st.get("cond") not in {"close_above","close_below","touch_above","touch_below"}:
         st["cond"] = "close_below" if p.get("side","long")=="long" else "close_above"
         warnings.append("Unsupported stop cond; default applied.")
-    try: st["level"] = float(st.get("level"))
-    except Exception: return None, ["Invalid stop level."]
-    p["stop"] = st
-    try: p["quantity"] = int(p.get("quantity",1))
+    try:
+        st["level"] = float(st.get("level"))
     except Exception:
-        p["quantity"] = 1; warnings.append("Invalid quantity; defaulted to 1.")
+        return None, ["Invalid stop level."]
+    p["stop"] = st
+    try:
+        p["quantity"] = int(p.get("quantity",1))
+    except Exception:
+        p["quantity"] = 1
+        warnings.append("Invalid quantity; defaulted to 1.")
     good_tps=[]
     for tp in p.get("tps",[]):
         trig = tp.get("trigger",{})
@@ -338,7 +484,7 @@ def sanitize_parsed(p: Dict[str,Any]) -> Tuple[Optional[Dict[str,Any]], List[str
     p["tps"]=good_tps
     return p, warnings
 
-# --------------- TRADIER HELPERS ---------------
+# ---------------- TRADIER HELPERS ----------------
 def live_quote(symbol: str) -> Optional[float]:
     if not symbol:
         return None
@@ -349,15 +495,21 @@ def live_quote(symbol: str) -> Optional[float]:
     if not q: return None
     if isinstance(q, list) and q:
         q = q[0]
-    return float(q.get("last") or q.get("bid") or 0)
+    try:
+        # prefer mid if present
+        bid = q.get("bid"); ask = q.get("ask")
+        if bid is not None and ask is not None and float(ask) > 0:
+            return (float(bid)+float(ask))/2.0
+        return float(q.get("last") or q.get("bid") or 0)
+    except Exception:
+        return None
 
 def get_option_chain(symbol: str, dte: int=14, greeks=True):
     h = {"Authorization": f"Bearer {TRADIER_LIVE_API_KEY}", "Accept":"application/json"}
     exp_resp = requests.get(f"{TRADIER_LIVE}/v1/markets/options/expirations",
                             params={"symbol":symbol,"includeAllRoots":"true"}, headers=h, timeout=10).json()
     exps = exp_resp.get("expirations",{}).get("date",[])
-    # pick nearest future expiry (simple heuristic)
-    best = exps[0] if exps else None
+    best = exps[0] if exps else None  # TODO: choose nearest to dte
     chain = requests.get(f"{TRADIER_LIVE}/v1/markets/options/chains",
                          params={"symbol":symbol,"expiration":best,"greeks":"true" if greeks else "false"},
                          headers=h, timeout=10).json()
@@ -374,12 +526,30 @@ def pick_contract(chain: List[Dict[str,Any]], side: str, target_delta: float=0.5
     return min(candidates, key=lambda c: abs(abs(float(c.get("delta",0))) - float(target_delta)))
 
 def sandbox_place_option_order(occ_symbol: str, action: str, qty: int, order_type="market", limit_price=None, duration="day"):
-    """
-    action: buy_to_open | sell_to_close | buy_to_close | sell_to_open
-    """
     h = {"Authorization": f"Bearer {TRADIER_SANDBOX_API_KEY}", "Accept":"application/json"}
-    data = {"class":"option","symbol":occ_symbol,"side":action,"quantity":qty,"type":order_type,"duration":duration}
+    data = {"class":"option","symbol": occ_symbol,"side": action,"quantity": qty,"type": order_type,"duration": duration}
     if limit_price is not None: data["price"] = f"{float(limit_price):.2f}"
+    url = f"{TRADIER_SANDBOX}/v1/accounts/{TRADIER_SANDBOX_ACCOUNT_ID}/orders"
+    r = requests.post(url, data=data, headers=h, timeout=15)
+    return r.json()
+
+def sandbox_place_equity_order(symbol: str, side: str, qty: int, last_price: float):
+    """
+    Stocks: RTH → MARKET/DAY; pre/post → LIMIT with duration=pre/post (if EXTENDED_STOCK_ENABLED).
+    """
+    sess = market_session_ny()
+    if sess == "rth" or not EXTENDED_STOCK_ENABLED:
+        order_type = "market"; duration = "day"; price = None
+    elif sess in ("pre","post"):
+        order_type = "limit"; duration = "pre" if sess == "pre" else "post"
+        bump = (EXTENDED_LIMIT_SLIPPAGE_BPS / 10000.0) * last_price
+        price = (last_price + bump) if side.lower().startswith("buy") else (last_price - bump)
+        price = round(price, 2)
+    else:
+        raise RuntimeError("Market closed (no pre/post). Try during pre, RTH, or post.")
+    h = {"Authorization": f"Bearer {TRADIER_SANDBOX_API_KEY}", "Accept":"application/json"}
+    data = {"class":"equity","symbol":symbol,"side":side,"quantity":qty,"type":order_type,"duration":duration}
+    if price is not None: data["price"] = f"{price:.2f}"
     url = f"{TRADIER_SANDBOX}/v1/accounts/{TRADIER_SANDBOX_ACCOUNT_ID}/orders"
     r = requests.post(url, data=data, headers=h, timeout=15)
     return r.json()
@@ -393,34 +563,145 @@ def sandbox_list_positions():
     if isinstance(pos, dict): pos = [pos]
     return pos or []
 
-def sandbox_place_equity_order(symbol: str, side: str, qty: int, last_price: float, session_hint: Optional[str]=None):
-    """
-    Stocks: RTH → MARKET/DAY; pre/post → LIMIT with duration=pre/post.
-    session_hint: 'ETH' to force extended logic if enabled; otherwise None = decide by clock.
-    """
-    sess = market_session_ny()
-    if session_hint == "ETH" and EXTENDED_STOCK_ENABLED:
-        # keep sess as current; if closed, this will error below
-        pass
-
-    if sess == "rth" or not EXTENDED_STOCK_ENABLED or session_hint != "ETH":
-        order_type = "market"; duration = "day"; price = None
-    elif sess in ("pre","post"):
-        order_type = "limit"; duration = "pre" if sess == "pre" else "post"
-        bump = (EXTENDED_LIMIT_SLIPPAGE_BPS / 10000.0) * last_price
-        price = (last_price + bump) if side.lower().startswith("buy") else (last_price - bump)
-        price = round(price, 2)
-    else:
-        raise RuntimeError("Market closed (no pre/post). Try during pre, RTH, or post.")
-
+def sandbox_list_orders(include_all=False):
     h = {"Authorization": f"Bearer {TRADIER_SANDBOX_API_KEY}", "Accept":"application/json"}
-    data = {"class":"equity","symbol":symbol,"side":side,"quantity":qty,"type":order_type,"duration":duration}
-    if price is not None: data["price"] = f"{price:.2f}"
     url = f"{TRADIER_SANDBOX}/v1/accounts/{TRADIER_SANDBOX_ACCOUNT_ID}/orders"
-    r = requests.post(url, data=data, headers=h, timeout=15)
-    return r.json()
+    r = requests.get(url, headers=h, timeout=15)
+    r.raise_for_status()
+    data = r.json().get("orders", {}).get("order", [])
+    if isinstance(data, dict):
+        data = [data]
+    if include_all:
+        return data
+    final_states = {"filled","canceled","cancelled","expired","rejected","done","closed"}
+    openish = [o for o in data if str(o.get("status","")).lower() not in final_states]
+    return openish
 
-# --------------- STATE ---------------
+# ---------- TOOL ADAPTERS (for GPT tool-calling) ----------
+def sandbox_list_positions_filtered(symbols=None):
+    pos = sandbox_list_positions()
+    if symbols:
+        syms = set(s.upper() for s in symbols)
+        pos = [p for p in pos if (p.get("underlying") or p.get("symbol","")).upper() in syms]
+    out=[]
+    for p in pos:
+        cls = (p.get("class") or "").lower()
+        qty = int(abs(int(p.get("quantity",0) or 0)))
+        sym = p.get("symbol")
+        ul  = p.get("underlying") or p.get("symbol")
+        exp = p.get("expiry") or infer_expiry_from_occ(sym) if cls=="option" else None
+        out.append({"class": cls,"symbol": sym,"underlying": (ul or "").upper(),"quantity": qty,"expiry": exp})
+    return out
+
+def infer_expiry_from_occ(occ_symbol: Optional[str]) -> Optional[str]:
+    if not occ_symbol: return None
+    m = re.search(r"(\d{6})", occ_symbol)
+    if not m: return None
+    yymmdd = m.group(1)
+    yy, mm, dd = yymmdd[:2], yymmdd[2:4], yymmdd[4:6]
+    yyyy = int(yy) + 2000
+    return f"{yyyy:04d}-{int(mm):02d}-{int(dd):02d}"
+
+def sandbox_list_orders_filtered(symbols=None, open_only=True):
+    orders = sandbox_list_orders(include_all=not open_only)
+    if symbols:
+        syms = set(s.upper() for s in symbols)
+        orders = [o for o in orders if (o.get("underlying") or o.get("symbol","")).upper() in syms]
+    out=[]
+    for o in orders:
+        out.append({
+            "id": o.get("id"),
+            "class": (o.get("class") or "").lower(),
+            "symbol": o.get("symbol"),
+            "underlying": (o.get("underlying") or o.get("underlying_symbol") or o.get("symbol","")).upper(),
+            "side": o.get("side"),
+            "type": (o.get("type") or "").lower(),
+            "quantity": o.get("quantity"),
+            "status": (o.get("status") or "").lower(),
+            "duration": (o.get("duration") or "day").lower(),
+            "price": o.get("price")
+        })
+    return out
+
+def close_options_occ(occ_symbols, order_type="market", limit=None):
+    pos = sandbox_list_positions()
+    qty_by_occ = {}
+    for p in pos:
+        if p.get("class")!="option": continue
+        occ = p.get("symbol")
+        if occ in occ_symbols:
+            qty_by_occ[occ] = int(abs(int(p.get("quantity",0) or 0)))
+    res = {"closed":0,"details":[]}
+    for occ in occ_symbols:
+        q = qty_by_occ.get(occ, 0)
+        if q <= 0:
+            res["details"].append({"occ":occ,"result":"no_position"}); continue
+        if order_type=="limit" and limit is not None:
+            r = sandbox_place_option_order(occ, action="sell_to_close", qty=q, order_type="limit", limit_price=float(limit))
+        else:
+            r = sandbox_place_option_order(occ, action="sell_to_close", qty=q, order_type="market")
+        res["closed"] += q
+        res["details"].append({"occ":occ,"qty":q,"result":r})
+    return res
+
+def sandbox_list_positions_detailed():
+    """Return positions with avg cost (if provided), live price, and PL%."""
+    pos = sandbox_list_positions()
+    if not pos: return []
+    eq_syms = []; occ_syms = []
+    for p in pos:
+        if p.get("class") == "equity":
+            eq_syms.append(p.get("symbol"))
+        elif p.get("class") == "option":
+            occ_syms.append(p.get("symbol"))
+    quotes_map = {}
+    def fetch_quotes(symbols):
+        if not symbols: return {}
+        h = {"Authorization": f"Bearer {TRADIER_LIVE_API_KEY}", "Accept":"application/json"}
+        r = requests.get(f"{TRADIER_LIVE}/v1/markets/quotes", params={"symbols": ",".join(symbols)}, headers=h, timeout=12)
+        r.raise_for_status()
+        q = r.json().get("quotes",{}).get("quote",[])
+        if isinstance(q, dict): q=[q]
+        out={}
+        for row in q:
+            sym = row.get("symbol")
+            bid = row.get("bid"); ask = row.get("ask"); last = row.get("last")
+            if bid is not None and ask is not None and float(ask) > 0:
+                px = (float(bid)+float(ask))/2.0
+            elif last is not None:
+                px = float(last)
+            else:
+                px = float(bid or 0)
+            out[sym] = px
+        return out
+    quotes_map.update(fetch_quotes(eq_syms))
+    quotes_map.update(fetch_quotes(occ_syms))
+    detailed=[]
+    for p in pos:
+        cls = (p.get("class") or "").lower()
+        qty = int(abs(int(p.get("quantity",0) or 0)))
+        sym = p.get("symbol")
+        ul  = (p.get("underlying") or p.get("symbol") or "").upper()
+        avg = None
+        if p.get("price") not in (None, "", "null"):
+            try: avg = float(p.get("price"))
+            except: avg = None
+        if avg is None and p.get("cost_basis") not in (None, "", "null"):
+            try:
+                cb = float(p.get("cost_basis")); avg = cb / qty if qty else None
+            except: pass
+        live = quotes_map.get(sym) or quotes_map.get(ul) or None
+        pl_pct = None
+        if avg is not None and live is not None and avg != 0:
+            pl_pct = 100.0 * (live - avg) / avg
+        detailed.append({
+            "class": cls,"symbol": sym,"underlying": ul,"quantity": qty,
+            "avg_price": avg,"live_price": live,"pl_pct": pl_pct,
+            "expiry": infer_expiry_from_occ(sym) if cls=="option" else None
+        })
+    return detailed
+
+# ---------------- STATE (minimal, used for buttons) ----------------
 class PositionStore:
     def __init__(self): self.state: Dict[str,Dict[str,Any]] = {}
     def add(self, tid:str, rec:Dict[str,Any]): self.state[tid]=rec
@@ -431,7 +712,7 @@ class PositionStore:
 
 positions = PositionStore()
 
-# --------------- DISCORD BOT ---------------
+# ---------------- DISCORD BOT ----------------
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -466,22 +747,30 @@ async def on_ready():
         print(f"Slash commands synced: {len(synced)}")
     except Exception as e:
         print("Slash sync error:", e)
-    # Restart-safe: reload active trades
     try:
         active = read_active_trades()
         for rec in active:
             tid = rec["trade_id"]
             asyncio.create_task(safe_watch(tid, rec, None))
+            # also hydrate minimal view for !positions (internal, optional)
+            positions.add(tid, {
+                "contract": f"{rec['ticker']} (active)",
+                "remaining_qty": rec.get("quantity", 0),
+                "avg_entry_premium": 0.0,
+                "underlying_at_entry": 0.0,
+                "stop_desc": f"{rec['stop']['tf']} {rec['stop']['cond']} {rec['stop']['level']}",
+                "tp_desc": ", ".join([str(tp['trigger']['level']) for tp in rec.get('tps',[])]),
+                "status": "active",
+            })
         print(f"Reloaded {len(active)} active trade(s) from {ACTIVE_TRADES_TAB}.")
     except Exception as e:
         print("ActiveTrades reload error:", e)
 
-# Slash: /positions
-@bot.tree.command(name="positions", description="Show active positions")
+# Slash: /positions (Tradier-only)
+@bot.tree.command(name="positions", description="Show positions & working orders from Tradier (sandbox)")
 async def slash_positions(interaction: discord.Interaction):
     await show_positions(interaction)
 
-# Slash: /health
 @bot.tree.command(name="health", description="Check Sheets + Tradier connectivity")
 async def health(interaction: discord.Interaction):
     try:
@@ -500,28 +789,64 @@ async def positions_cmd(ctx):
     await show_positions(ctx)
 
 async def show_positions(ctx_or_inter):
-    active = positions.all_active()
-    if not active:
-        msg = "No active positions."
-        if isinstance(ctx_or_inter, discord.Interaction):
-            await ctx_or_inter.response.send_message(msg, ephemeral=True)
-        else:
-            await ctx_or_inter.send(msg)
-        return
-    lines=[]; last_tid=None
-    for tid, rec in active.items():
-        last_tid = tid
-        lines.append(
-            f"• **{rec['contract']}** — Qty **{rec['remaining_qty']}** — Avg ${rec.get('avg_entry_premium',0):.2f}\n"
-            f"  SL: {rec['stop_desc']} | TP: {rec['tp_desc']} | Trade ID: `{tid}`"
-        )
-    content = "**Active Positions (Sandbox)**\n" + "\n".join(lines)
-    view = ActionView(last_tid) if last_tid else None
-    if isinstance(ctx_or_inter, discord.Interaction):
-        await ctx_or_inter.response.send_message(content, ephemeral=True, view=view)
-    else:
-        await ctx_or_inter.send(content, view=view)
+    """Shows ONLY Tradier sandbox positions + pending/working orders."""
+    try:
+        pos = sandbox_list_positions()
+    except Exception as e:
+        pos = []; print("Positions fetch error:", e)
 
+    try:
+        open_orders = sandbox_list_orders(include_all=False)
+    except Exception as e:
+        open_orders = []; print("Orders fetch error:", e)
+
+    lines = []
+    if pos:
+        lines.append("**📦 Open Positions (Tradier Sandbox)**")
+        for p in pos:
+            asset_cls = p.get("class","").lower()
+            qty = abs(int(p.get("quantity",0) or 0))
+            if qty <= 0:
+                continue
+            if asset_cls == "equity":
+                sym = p.get("symbol") or p.get("underlying") or "?"
+
+                lines.append(f"• {sym} — {qty} shares")
+            elif asset_cls == "option":
+                occ = p.get("symbol","?"); ul = p.get("underlying","?")
+                lines.append(f"• {occ} (UL: {ul}) — {qty} contract(s)")
+            else:
+                lines.append(f"• {p.get('symbol','?')} — {qty} (class: {asset_cls})")
+    else:
+        lines.append("**📦 Open Positions (Tradier Sandbox)**\n• None")
+
+    if open_orders:
+        lines.append("\n**📝 Working / Pending Orders (Tradier Sandbox)**")
+        for o in open_orders:
+            cls = o.get("class","").lower()
+            status = o.get("status","?").upper()
+            side = o.get("side","?")
+            typ = o.get("type","?").upper()
+            qty = o.get("quantity","?")
+            dur = o.get("duration","day").upper()
+            limit_px = o.get("price")
+            sym = o.get("symbol","?")
+            ul = o.get("underlying") or o.get("underlying_symbol") or ""
+            tail = f" @ {limit_px}" if limit_px is not None else ""
+            if cls == "option" and ul:
+                lines.append(f"• [{status}] {side} {qty} {sym} ({ul}) — {typ}{tail} / {dur}")
+            else:
+                lines.append(f"• [{status}] {side} {qty} {sym} — {typ}{tail} / {dur}")
+    else:
+        lines.append("\n**📝 Working / Pending Orders (Tradier Sandbox)**\n• None")
+
+    content = "\n".join(lines)
+    if isinstance(ctx_or_inter, discord.Interaction):
+        await ctx_or_inter.response.send_message(content, ephemeral=True)
+    else:
+        await ctx_or_inter.send(content)
+
+# ---------------- BUTTON COMMANDS ----------------
 @bot.command()
 async def closeall(ctx, trade_id: str, confirm: str = ""):
     if confirm != "--confirm": return await ctx.send("Add `--confirm` to proceed.")
@@ -569,24 +894,17 @@ async def moveSLBE(ctx, trade_id: str, confirm: str = ""):
     update_trade_history(trade_id, {"stop_rule": be_desc, "notes":"SL→BE"})
     await ctx.send(f"✏️ **SL moved to BE** — {be_desc} — `{trade_id}`")
 
-# --------------- QUICK INTENTS ---------------
+# ---------------- QUICK-INTENT PARSERS ----------------
 def try_immediate_stock_intent(text: str):
-    """
-    Detects: 'buy 10 AMD shares [in ETH]' | 'sell 5 TSLA shares'
-    """
-    m = re.search(r"\b(buy|sell)\s+(\d+)\s+([A-Za-z]{1,5})\s+shares\b", text, re.I)
+    m = re.search(r"\b(buy|sell)\s+(?:(\d+)\s+)?([A-Za-z]{1,5})\s+shares\b", text, re.I)
     if not m: return None
     side = "buy" if m.group(1).lower()=="buy" else "sell"
-    qty = int(m.group(2))
+    qty = int(m.group(2) or 1)
     ticker = m.group(3).upper()
     eth = bool(re.search(r"\b(eth|extended|pre[- ]?market|post[- ]?market|after[- ]?hours)\b", text, re.I))
     return {"ticker":ticker,"side":side,"qty":qty,"session":"ETH" if eth else "RTH"}
 
 def try_immediate_option_intent(text: str):
-    """
-    Detects: 'AMD call in RTH', '2 tsla puts eth', 'nvda call'
-    Defaults: dte=14, delta=0.5, market, qty=1
-    """
     m = re.search(r"\b(?:(\d+)\s*)?([A-Za-z]{1,5})\s+(call|calls|put|puts)\b", text, re.I)
     if not m: return None
     qty = int(m.group(1) or 1)
@@ -594,90 +912,88 @@ def try_immediate_option_intent(text: str):
     opt_type = m.group(3).lower()
     side = "long" if "call" in opt_type else "short"
     eth = bool(re.search(r"\b(eth|extended|pre[- ]?market|post[- ]?market|after[- ]?hours)\b", text, re.I))
-    return {
-        "ticker": ticker, "asset_type": "option", "side": side, "quantity": qty,
-        "session": "ETH" if eth else "RTH",
-        "option_select": {"dte": 14, "delta": 0.5, "type": "auto", "choose":"nearest_delta"}
-    }
+    return {"ticker": ticker,"asset_type": "option","side": side,"quantity": qty,"session": "ETH" if eth else "RTH",
+            "option_select": {"dte": 14, "delta": 0.5, "type": "auto", "choose":"nearest_delta"}}
 
 def try_close_option_intent(text: str):
-    """
-    'close amd options' | 'close 50% amd calls' | 'close 2 amd puts at limit 2.50'
-    """
     m = re.search(r"\bclose\s+(?:(\d+)%\s+|(\d+)\s+)?([A-Za-z]{1,5})\s+(options|calls?|puts?)\b(?:.*?\bat\s+limit\s+(\d+(?:\.\d+)?))?", text, re.I)
-    if m:
-        pct = int(m.group(1)) if m.group(1) else None
-        qty_abs = int(m.group(2)) if m.group(2) else None
-        ticker = m.group(3).upper()
-        kind = m.group(4).lower()
-        limit_px = float(m.group(5)) if m.group(5) else None
-        filt = None if "option" in kind else ("call" if "call" in kind else "put")
-        return {"ticker":ticker,"type_filter":filt,"pct":pct,"qty_abs":qty_abs,"limit":limit_px}
-    m2 = re.search(r"\bclose\s+([A-Za-z]{1,5})\s+(options|calls?|puts?)\b(?:.*?\bat\s+limit\s+(\d+(?:\.\d+)?))?", text, re.I)
-    if m2:
-        ticker = m2.group(1).upper()
-        kind = m2.group(2).lower()
+    if not m:
+        m2 = re.search(r"\bclose\s+([A-Za-z]{1,5})\s+(options|calls?|puts?)\b(?:.*?\bat\s+limit\s+(\d+(?:\.\d+)?))?", text, re.I)
+        if not m2: return None
+        pct = None; qty_abs = None
+        ticker = m2.group(1).upper(); kind = m2.group(2).lower()
         limit_px = float(m2.group(3)) if m2.group(3) else None
         filt = None if "option" in kind else ("call" if "call" in kind else "put")
-        return {"ticker":ticker,"type_filter":filt,"pct":None,"qty_abs":None,"limit":limit_px}
-    return None
+        return {"ticker":ticker,"type_filter":filt,"pct":pct,"qty_abs":qty_abs,"limit":limit_px}
+    pct = int(m.group(1)) if m.group(1) else None
+    qty_abs = int(m.group(2)) if m.group(2) else None
+    ticker = m.group(3).upper(); kind = m.group(4).lower()
+    limit_px = float(m.group(5)) if m.group(5) else None
+    filt = None if "option" in kind else ("call" if "call" in kind else "put")
+    return {"ticker":ticker,"type_filter":filt,"pct":pct,"qty_abs":qty_abs,"limit":limit_px}
 
-def close_options_by_underlying(underlying: str, type_filter: Optional[str], pct: Optional[int], qty_abs: Optional[int], limit_price: Optional[float]) -> Dict[str, Any]:
-    positions_list = sandbox_list_positions()
-    matched = []
-    for p in positions_list:
-        if p.get("class") != "option": continue
-        if str(p.get("underlying","")).upper() != underlying.upper(): continue
-        opt_type = (p.get("option_type") or "").lower()
-        if not opt_type:
-            # infer from OCC symbol suffix
-            try:
-                opt_type = "call" if p["symbol"][-1].upper()=="C" else "put"
-            except Exception:
-                opt_type = None
-        if type_filter and opt_type != type_filter:
-            continue
-        matched.append(p)
+def try_move_sl_be_intent(text: str):
+    t = text.lower()
+    if "break even" not in t and "breakeven" not in t and "sl→be" not in t and "to be" not in t:
+        return None
+    m_tkr = re.search(r"\b([A-Za-z]{1,5})\b", text)
+    m_sp = re.search(r"\b(\d+(?:\.\d+)?)\s*([cp])\b", text, re.I)
+    m_exp = re.search(r"\b(\d{1,2})/(\d{1,2})\b", text) or re.search(r"\b(20\d{2})-(\d{2})-(\d{2})\b", text)
+    if not (m_tkr and m_sp and m_exp): return None
+    ticker = m_tkr.group(1).upper(); strike = float(m_sp.group(1)); tchar = m_sp.group(2).lower()
+    opt_type = "call" if tchar == "c" else "put"
+    if len(m_exp.groups())==2:
+        mm = int(m_exp.group(1)); dd = int(m_exp.group(2)); yr = datetime.utcnow().year
+        expiry = f"{yr:04d}-{mm:02d}-{dd:02d}"
+    else:
+        expiry = f"{int(m_exp.group(1)):04d}-{int(m_exp.group(2)):02d}-{int(m_exp.group(3)):02d}"
+    return {"action":"move_sl_be","ticker":ticker,"type":opt_type,"strike":strike,"expiry":expiry}
 
-    if not matched:
-        return {"closed":0,"details":[],"reason":"no_matching_positions"}
+def find_active_trades_by_contract(ticker: str, opt_type: str, strike: float, expiry: str):
+    acts = read_active_trades(); matches=[]
+    for a in acts:
+        if a.get("ticker") != ticker.upper(): continue
+        occ = (a.get("occ_symbol") or "").upper()
+        if occ:
+            if (opt_type=="call" and not occ.endswith("C")) or (opt_type=="put" and not occ.endswith("P")): continue
+        if a.get("strike") is not None and a.get("expiry"):
+            if abs(float(a["strike"])-float(strike))<0.01 and str(a["expiry"])==expiry:
+                matches.append(a)
+    return matches
 
-    plan = []
-    remaining_abs = qty_abs or 0
-    for p in matched:
-        qty = int(abs(int(p.get("quantity",0))))
-        if qty <= 0: continue
-        if pct is not None:
-            q_close = max(1, (qty * pct)//100)
-        elif qty_abs is not None:
-            q_close = min(qty, remaining_abs)
-            remaining_abs -= q_close
-        else:
-            q_close = qty
-        if q_close <= 0: continue
-        plan.append((p["symbol"], q_close))
-        if qty_abs is not None and remaining_abs <= 0: break
+def move_stop_to_break_even(trade_id: str):
+    rownum, header = gs_find_row(TRADES_TAB, "trade_id", trade_id)
+    if not rownum:
+        return False, "trade_id not found in Trades"
+    cur = gs_read_row(TRADES_TAB, rownum, endcol="Z")
+    try: idx_entry_under = header.index("underlying_at_entry")
+    except ValueError: return False, "Trades missing 'underlying_at_entry' column"
+    try: be_level = float(cur[idx_entry_under])
+    except Exception: be_level = None
+    be_desc = f"BE @ underlying {be_level:.2f}" if be_level is not None else "BE @ entry underlying"
+    update_trade_history(trade_id, {"stop_rule": be_desc, "notes":"SL→BE"})
+    positions.set(trade_id, "stop_desc", be_desc)
+    rownumA, headerA = gs_find_row(ACTIVE_TRADES_TAB, "trade_id", trade_id)
+    if rownumA:
+        curA = gs_read_row(ACTIVE_TRADES_TAB, rownumA, endcol="Z"); curA += [""]*(len(headerA)-len(curA))
+        try:
+            ent_tf_idx = headerA.index("entry_tf"); stop_tf_idx = headerA.index("stop_tf")
+            stop_cond_idx = headerA.index("stop_cond"); stop_level_idx = headerA.index("stop_level")
+        except ValueError:
+            return True, "ActiveTrades missing stop columns; updated Trades/in-memory only"
+        if not curA[stop_tf_idx]: curA[stop_tf_idx] = curA[ent_tf_idx]
+        curA[stop_cond_idx] = "close_below"
+        if be_level is not None: curA[stop_level_idx] = f"{be_level:.2f}"
+        gs_update_row(ACTIVE_TRADES_TAB, rownumA, curA)
+    return True, be_desc
 
-    closed=0; details=[]
-    for occ, q in plan:
-        if limit_price is not None:
-            resp = sandbox_place_option_order(occ, action="sell_to_close", qty=q, order_type="limit", limit_price=limit_price, duration="day")
-        else:
-            resp = sandbox_place_option_order(occ, action="sell_to_close", qty=q, order_type="market", duration="day")
-        details.append({"occ":occ,"qty":q,"resp":resp})
-        closed += q
-
-    return {"closed":closed,"details":details,"reason":"ok"}
-
-# --------------- MESSAGE LISTENER ---------------
+# ---------------- MESSAGE LISTENER ----------------
 async def safe_watch(trade_id, parsed, channel: Optional[discord.TextChannel]):
     try:
         await watch_and_execute(trade_id, parsed, channel)
     except Exception as e:
-        if channel:
-            await channel.send(f"⚠️ Watcher stopped for `{trade_id}`: {e}")
-        else:
-            print(f"Watcher stopped for {trade_id}: {e}")
+        if channel: await channel.send(f"⚠️ Watcher stopped for `{trade_id}`: {e}")
+        else: print(f"Watcher stopped for {trade_id}: {e}")
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -687,77 +1003,101 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
     if content.startswith("!"): return
 
-    # Quick CLOSE options intent
-    close_intent = try_close_option_intent(content)
-    if close_intent:
-        tkr = close_intent["ticker"]
-        filt = close_intent["type_filter"]
-        pct = close_intent["pct"]
-        qty_abs = close_intent["qty_abs"]
-        limit_px = close_intent["limit"]
+    # CONFIRM flow: execute pending close for this channel
+    if content.strip().upper() == "CONFIRM":
+        key = str(message.channel.id)
+        pending = PENDING_ACTIONS.get(key)
+        if not pending:
+            return await message.channel.send("Nothing pending to confirm.")
+        res = close_options_occ(pending["occ_symbols"], pending.get("order_type","market"), pending.get("limit"))
+        del PENDING_ACTIONS[key]
+        lines = [f"✅ Executed close for {len(res['details'])} leg(s):"]
+        for d in res["details"]:
+            if d.get("result") == "no_position":
+                lines.append(f"• {d['occ']}: no open qty")
+            else:
+                lines.append(f"• {d['occ']}: closed {d.get('qty','?')} @ {pending.get('order_type','market')}{(' ' + str(pending.get('limit'))) if pending.get('limit') else ''}")
+        return await message.channel.send("\n".join(lines))
 
+    # Orchestrator router for "show/close" style requests (multi-turn GPT tools)
+    lowered = content.lower()
+    orchestrate_triggers = (lowered.startswith("show ") or lowered.startswith("list ") or lowered.startswith("get ") or lowered.startswith("close ") or "profit" in lowered)
+    if orchestrate_triggers:
+        try:
+            result_text = gpt_orchestrate(content, channel_id=str(message.channel.id))
+            return await message.channel.send(result_text)
+        except Exception as e:
+            print("Orchestrator error:", e)
+
+    # Move SL → BE quick intent
+    msl = try_move_sl_be_intent(content)
+    if msl:
+        matches = find_active_trades_by_contract(msl["ticker"], msl["type"], msl["strike"], msl["expiry"])
+        if not matches:
+            return await message.channel.send("ℹ️ No matching active option trade found for that contract. (Ensure the bot opened/logged it.)")
+        count=0; notes=[]
+        for a in matches:
+            ok, desc = move_stop_to_break_even(a["trade_id"])
+            if ok:
+                count+=1; notes.append(f"• `{a['trade_id']}` → {desc}")
+        if count==0:
+            return await message.channel.send("⚠️ Could not update SL to BE. Check sheet headers/columns.")
+        return await message.channel.send("✏️ **SL moved to Break-Even**\n" + "\n".join(notes))
+
+    # Quick intents: CLOSE OPTIONS
+    ci = try_close_option_intent(content)
+    if ci:
+        tkr = ci["ticker"]; filt = ci["type_filter"]; pct = ci["pct"]; qty_abs = ci["qty_abs"]; limit_px = ci["limit"]
         ul_last = live_quote(tkr) or 0.0
         res = close_options_by_underlying(tkr, filt, pct, qty_abs, limit_px)
         if res["reason"] == "no_matching_positions":
             return await message.channel.send(f"ℹ️ No open {tkr} option positions to close.")
-        closed = res["closed"]
-        flavor = "options" if filt is None else (filt + "s")
+        closed = res["closed"]; flavor = "options" if filt is None else (filt + "s")
         limit_txt = f" at limit {limit_px:.2f}" if limit_px is not None else " at market"
         qty_txt = (f"{pct}% of" if pct is not None else (f"{qty_abs} of" if qty_abs is not None else "all"))
-        await message.channel.send(
-            f"✅ Closed **{qty_txt} {tkr} {flavor}**{limit_txt} — Underlying last {ul_last:.2f}\n"
-            f"Total contracts closed: **{closed}**"
-        )
-        # optional: list each occ symbol
+        await message.channel.send(f"✅ Closed **{qty_txt} {tkr} {flavor}**{limit_txt} — Underlying last {ul_last:.2f}\nTotal contracts closed: **{closed}**")
         for d in res["details"]:
             await message.channel.send(f"• Sold to close {d['qty']} × {d['occ']}{' @ limit' if limit_px is not None else ' @ market'}")
         return
 
-    # Quick BUY/SELL STOCK immediate intent
-    imm_stock = try_immediate_stock_intent(content)
-    if imm_stock:
-        ticker = imm_stock["ticker"]; qty = int(imm_stock["qty"]); side = imm_stock["side"]
-        session_hint = imm_stock["session"]  # 'RTH' or 'ETH'
-        last = live_quote(ticker) or 0.0
+    # Quick intents: IMMEDIATE STOCK
+    isty = try_immediate_stock_intent(content)
+    if isty:
+        tkr = isty["ticker"]; qty = int(isty["qty"]); side = isty["side"]; session = isty["session"]
+        last = live_quote(tkr) or 0.0
+        global EXTENDED_STOCK_ENABLED
+        prev = EXTENDED_STOCK_ENABLED
+        if session == "ETH": EXTENDED_STOCK_ENABLED = True
         try:
-            resp = sandbox_place_equity_order(ticker, side, qty, float(last), session_hint=("ETH" if session_hint=="ETH" else None))
-        except Exception as e:
-            return await message.channel.send(f"⚠️ Stock order failed ({ticker}): {e}")
-        trade_id = f"{ticker}-{datetime.utcnow().strftime('%Y%m%d')}-{int(time.time())%100000:05d}"
+            resp = sandbox_place_equity_order(tkr, side, qty, float(last))
+        finally:
+            EXTENDED_STOCK_ENABLED = prev
+        trade_id = f"{tkr}-{datetime.utcnow().strftime('%Y%m%d')}-{int(time.time())%100000:05d}"
         append_trade_history({
-            "trade_id": trade_id, "source":"Discord", "ticker":ticker,
+            "trade_id": trade_id, "source":"Discord", "ticker":tkr,
             "asset_type":"stock", "side": ("long" if side=="buy" else "short"),
-            "contract": f"{ticker} shares",
-            "qty_total": qty, "status":"active", "entry_time": now_iso(),
-            "underlying_at_entry": f"{last:.2f}", "notes": f"Immediate stock entry ({session_hint})"
+            "contract": f"{tkr} shares","qty_total": qty, "status":"active", "entry_time": now_iso(),
+            "underlying_at_entry": f"{last:.2f}", "notes": f"Immediate stock entry ({session})"
         })
-        # Add a minimal ActiveTrades row (no SL/TP for immediates)
         append_active_trade(trade_id, {
-            "ticker": ticker, "side": ("long" if side=="buy" else "short"),
-            "entry": {"tf":"1m","cond":"touch_above","level": last},
-            "stop": {"tf":"1m","cond":"close_below","level": 0},
-            "tps": [], "notes": f"Immediate {session_hint}"
+            "ticker": tkr, "side": ("long" if side=="buy" else "short"),
+            "entry":{"tf":"1m","cond":"touch_above","level": last},
+            "stop":{"tf":"1m","cond":"close_below","level": 0}, "tps": [], "notes": f"Immediate {session}"
         }, qty=qty, status="active")
-        return await message.channel.send(
-            f"✅ **Stock order sent** — {qty} {ticker} ({session_hint}) @ Market\n"
-            f"Trade ID: `{trade_id}` | Last: {last:.2f}"
-        )
+        positions.add(trade_id, {"contract": f"{tkr} shares","remaining_qty": qty,"avg_entry_premium": 0.0,
+                                 "underlying_at_entry": last,"stop_desc": "—","tp_desc": "—","status": "active"})
+        return await message.channel.send(f"✅ **Stock order sent** — {qty}× {tkr} ({session})\nTrade ID: `{trade_id}` | Underlying last: {last:.2f}")
 
-    # Quick BUY OPTIONS immediate intent (2-week, Δ0.5, market)
-    imm_opt = try_immediate_option_intent(content)
-    if imm_opt:
-        ticker = imm_opt["ticker"]; qty = int(imm_opt["quantity"]); side = imm_opt["side"]; session = imm_opt["session"]
+    # Quick intents: IMMEDIATE OPTION
+    iopt = try_immediate_option_intent(content)
+    if iopt:
+        ticker = iopt["ticker"]; qty = int(iopt["quantity"]); side = iopt["side"]; session = iopt["session"]
         last = live_quote(ticker) or 0.0
-        try:
-            chain, expiry = get_option_chain(ticker, dte=imm_opt["option_select"]["dte"])
-            sel = pick_contract(chain=chain, side=side, target_delta=float(imm_opt["option_select"]["delta"]),
-                                strike=None, typ=imm_opt["option_select"]["type"])
-            occ = sel["symbol"]
-            contract_desc = f"{ticker} {expiry} {sel['strike']}{sel['option_type'][0].upper()} (Δ {float(sel.get('delta',0)):.2f})"
-            _ = sandbox_place_option_order(occ_symbol=occ, action="buy_to_open", qty=qty, order_type="market", duration="day")
-        except Exception as e:
-            return await message.channel.send(f"⚠️ Option order failed ({ticker}): {e}")
-
+        chain, expiry = get_option_chain(ticker, dte=iopt["option_select"]["dte"])
+        sel = pick_contract(chain=chain, side=side, target_delta=float(iopt["option_select"]["delta"]), strike=None, typ=iopt["option_select"]["type"])
+        occ = sel["symbol"]
+        contract_desc = f"{ticker} {expiry} {sel['strike']}{sel['option_type'][0].upper()} (Δ {float(sel.get('delta',0)):.2f})"
+        _ = sandbox_place_option_order(occ_symbol=occ, action="buy_to_open", qty=qty, order_type="market", duration="day")
         trade_id = f"{ticker}-{datetime.utcnow().strftime('%Y%m%d')}-{int(time.time())%100000:05d}"
         append_trade_history({
             "trade_id": trade_id, "source":"Discord", "ticker":ticker,
@@ -765,151 +1105,101 @@ async def on_message(message: discord.Message):
             "qty_total": qty, "status":"active", "entry_time": now_iso(),
             "underlying_at_entry": f"{last:.2f}", "notes": f"Immediate option entry ({session})"
         })
-        append_active_trade(trade_id, {
-            "ticker": ticker, "side": side,
-            "entry":{"tf":"1m","cond":"touch_above","level": last},
-            "stop":{"tf":"1m","cond":"close_below","level": 0},
-            "tps": [], "notes": f"Immediate {session}"
-        }, qty=qty, status="active")
-        return await message.channel.send(
-            f"✅ **Option order sent** — {qty}× {contract_desc} @ Market ({session})\n"
-            f"Trade ID: `{trade_id}` | Underlying last: {last:.2f}"
-        )
+        append_active_trade(trade_id, {"ticker": ticker, "side": side, "entry":{"tf":"1m","cond":"touch_above","level": last},
+                                       "stop":{"tf":"1m","cond":"close_below","level": 0}, "tps": [], "notes": f"Immediate {session}"},
+                            qty=qty, status="active", occ_symbol=occ, strike=float(sel['strike']), expiry=str(expiry))
+        positions.add(trade_id, {"contract": contract_desc,"remaining_qty": qty,"avg_entry_premium": 0.0,
+                                 "underlying_at_entry": last,"stop_desc": "—","tp_desc": "—","status": "active"})
+        await message.channel.send(f"✅ **Option order sent** — {qty}× {contract_desc} @ Market ({session})\nTrade ID: `{trade_id}` | Underlying last: {last:.2f}")
+        return
 
-    # LLM-parsed alert path (rules-based)
+    # Rule-based signals (LLM parser)
     try:
         raw = parse_alert_to_json(content)
     except Exception as e:
         return await message.channel.send(f"⚠️ Parse error: {e}")
-
     parsed, warns = sanitize_parsed(raw)
     if not parsed:
         return await message.channel.send("⚠️ Signal ignored: missing/invalid trade details (ticker/levels).")
-
     sig_id = f"sig-{int(time.time())}"
     append_signal({"signal_id":sig_id,"received_at":now_iso(),"raw_text":content,"parsed_json":parsed})
-    if warns:
-        await message.channel.send("ℹ️ " + " | ".join(warns))
-
+    if warns: await message.channel.send("ℹ️ " + " | ".join(warns))
     ticker = parsed["ticker"]
     entry_rule = f"{parsed['entry']['tf']} {parsed['entry']['cond']} {parsed['entry']['level']}"
     stop_rule  = f"{parsed['stop']['tf']} {parsed['stop']['cond']} {parsed['stop']['level']}"
     tp_rules   = ", ".join([f"{('qty '+str(tp.get('sell_qty')) if 'sell_qty' in tp else ('pct '+str(tp.get('sell_pct'))))} @ {tp['trigger']['level']}" for tp in parsed.get('tps',[])])
-
     trade_id = f"{ticker}-{datetime.utcnow().strftime('%Y%m%d')}-{int(time.time())%100000:05d}"
-    append_trade_history({
-        "trade_id": trade_id, "source":"Discord", "ticker":ticker,
-        "asset_type": parsed.get("asset_type","option"),
-        "side": parsed.get("side","long"),
-        "contract": "", "qty_total": parsed.get("quantity",1),
-        "status":"waiting_confirm", "entry_rule": entry_rule, "stop_rule": stop_rule,
-        "tp_rules": tp_rules, "notes": parsed.get("notes","")
-    })
+    append_trade_history({"trade_id": trade_id, "source":"Discord", "ticker":ticker,"asset_type": parsed.get("asset_type","option"),
+                          "side": parsed.get("side","long"),"contract": "", "qty_total": parsed.get("quantity",1),
+                          "status":"waiting_confirm","entry_rule": entry_rule, "stop_rule": stop_rule,
+                          "tp_rules": tp_rules, "notes": parsed.get("notes","")})
     append_active_trade(trade_id, parsed, qty=int(parsed.get("quantity",1)), status="waiting")
     await message.channel.send(f"📥 Signal queued `{trade_id}` for {ticker}. Watching for {entry_rule}.")
-
     asyncio.create_task(safe_watch(trade_id, parsed, message.channel))
 
-# --------------- WATCHERS ---------------
+# ---------------- WATCHERS (rule-based) ----------------
 def _tf_seconds(tf: str) -> int:
     return TF_SECONDS.get(tf, TF_SECONDS["15m"])
 
 async def watch_and_execute(trade_id: str, parsed: Dict[str,Any], channel: Optional[discord.TextChannel]):
-    ticker = parsed["ticker"].upper()
-    tf = parsed["entry"]["tf"]; tf_sec = _tf_seconds(tf)
+    ticker = parsed["ticker"].upper(); tf = parsed["entry"]["tf"]; tf_sec = _tf_seconds(tf)
     level = float(parsed["entry"]["level"]); cond = parsed["entry"]["cond"]
-
     if not ticker:
         if channel: await channel.send("⚠️ Aborting: empty ticker.")
         remove_active_trade(trade_id); return
-
     cur_bucket=None; o=h=l=c=None
     bucket = lambda ts: int(ts//tf_sec)*tf_sec
-
     while True:
         try:
             last = live_quote(ticker)
         except Exception as e:
             if channel: await channel.send(f"⚠️ Quote error for {ticker}: {e}")
             await asyncio.sleep(2); continue
-
         if last is None:
             await asyncio.sleep(1); continue
-
         now_ts = time.time(); b = bucket(now_ts)
         if cur_bucket != b:
             if cur_bucket is not None and c is not None:
                 trigger = (cond=="close_above" and c > level) or (cond=="close_below" and c < level)
                 if trigger:
-                    await place_entry_and_manage(trade_id, parsed, channel)
-                    return
+                    await place_entry_and_manage(trade_id, parsed, channel); return
             cur_bucket=b; o=h=l=c=last
         else:
             h=max(h,last); l=min(l,last); c=last
         await asyncio.sleep(1)
 
 async def place_entry_and_manage(trade_id:str, parsed:Dict[str,Any], channel: Optional[discord.TextChannel]):
-    ticker = parsed["ticker"].upper()
-    qty = int(parsed.get("quantity",1))
-    side = parsed.get("side","long")
-    asset_type = parsed.get("asset_type","option")
-
-    contract_desc = ""
-    underlying_now = live_quote(ticker) or 0.0
-
+    ticker = parsed["ticker"].upper(); qty = int(parsed.get("quantity",1))
+    side = parsed.get("side","long"); asset_type = parsed.get("asset_type","option")
+    contract_desc = ""; underlying_now = live_quote(ticker) or 0.0
     if asset_type == "stock":
-        contract_desc = f"{ticker} shares"
-        eq_side = "buy" if side == "long" else "sell_short"
+        contract_desc = f"{ticker} shares"; eq_side = "buy" if side == "long" else "sell_short"
         _ = sandbox_place_equity_order(ticker, eq_side, qty, float(underlying_now))
     else:
         chain, expiry = get_option_chain(ticker, dte=parsed.get("option_select",{}).get("dte",14))
-        sel = pick_contract(
-            chain=chain, side=side,
-            target_delta=float(parsed.get("option_select",{}).get("delta",0.5)),
-            strike=parsed.get("option_select",{}).get("strike"),
-            typ=parsed.get("option_select",{}).get("type","auto")
-        )
+        sel = pick_contract(chain=chain, side=side, target_delta=float(parsed.get("option_select",{}).get("delta",0.5)),
+                            strike=parsed.get("option_select",{}).get("strike"), typ=parsed.get("option_select",{}).get("type","auto"))
         occ = sel["symbol"]
         contract_desc = f"{ticker} {expiry} {sel['strike']}{sel['option_type'][0].upper()} (Δ {float(sel.get('delta',0)):.2f})"
         _ = sandbox_place_option_order(occ_symbol=occ, action="buy_to_open", qty=qty, order_type="market")
-
-    positions.add(trade_id,{
-        "contract": contract_desc,
-        "remaining_qty": qty,
-        "avg_entry_premium": 0.0,
-        "underlying_at_entry": underlying_now,
-        "stop_desc": f"{parsed['stop']['tf']} {parsed['stop']['cond']} {parsed['stop']['level']}",
-        "tp_desc": ", ".join([str(tp['trigger']['level']) for tp in parsed.get('tps',[])]),
-        "status":"active"
-    })
-    update_trade_history(trade_id, {
-        "status":"active","entry_time": now_iso(),
-        "contract": contract_desc, "underlying_at_entry": f"{underlying_now:.2f}"
-    })
-    if channel:
-        await channel.send(f"✅ **Trade Opened** — {contract_desc}\nQty: {qty} | Trade ID: `{trade_id}`", view=ActionView(trade_id))
-
+    positions.add(trade_id,{"contract": contract_desc,"remaining_qty": qty,"avg_entry_premium": 0.0,
+                            "underlying_at_entry": underlying_now,"stop_desc": f"{parsed['stop']['tf']} {parsed['stop']['cond']} {parsed['stop']['level']}",
+                            "tp_desc": ", ".join([str(tp['trigger']['level']) for tp in parsed.get('tps',[])]),"status":"active"})
+    update_trade_history(trade_id, {"status":"active","entry_time": now_iso(),"contract": contract_desc, "underlying_at_entry": f"{underlying_now:.2f}"})
+    if channel: await channel.send(f"✅ **Trade Opened** — {contract_desc}\nQty: {qty} | Trade ID: `{trade_id}`", view=ActionView(trade_id))
     asyncio.create_task(tp_sl_manager(trade_id, parsed, channel))
 
 async def tp_sl_manager(trade_id:str, parsed:Dict[str,Any], channel: Optional[discord.TextChannel]):
-    ticker = parsed["ticker"].upper()
-    tf = parsed["entry"]["tf"]; tf_sec = _tf_seconds(tf)
+    ticker = parsed["ticker"].upper(); tf = parsed["entry"]["tf"]; tf_sec = _tf_seconds(tf)
     stop_level = float(parsed["stop"]["level"]); stop_cond = parsed["stop"]["cond"]
-
-    cur_bucket=None; o=h=l=c=None
-    bucket = lambda ts: int(ts//tf_sec)*tf_sec
+    cur_bucket=None; o=h=l=c=None; bucket = lambda ts: int(ts//tf_sec)*tf_sec
     tps = parsed.get("tps",[])
-
     while True:
         last = live_quote(ticker)
-        if last is None:
-            await asyncio.sleep(1); continue
-
+        if last is None: await asyncio.sleep(1); continue
         rec = positions.get(trade_id)
         if not rec: return
         remaining = int(rec["remaining_qty"])
-
-        # TP touch
         for tp in list(tps):
             lvl = float(tp["trigger"]["level"]); cond = tp["trigger"]["cond"]
             touch = (cond.endswith("above") and last >= lvl) or (cond.endswith("below") and last <= lvl)
@@ -917,38 +1207,25 @@ async def tp_sl_manager(trade_id:str, parsed:Dict[str,Any], channel: Optional[di
                 if "sell_qty" in tp: slice_qty = min(int(tp["sell_qty"]), remaining)
                 elif "sell_pct" in tp: slice_qty = max(1, math.floor(remaining * (int(tp["sell_pct"])/100)))
                 else: slice_qty = 1
-                remaining -= slice_qty
-                positions.set(trade_id,"remaining_qty",remaining)
-                append_partial({
-                    "partial_id": f"{trade_id}-{int(time.time())}",
-                    "trade_id": trade_id, "type":"tp","timestamp": now_iso(),
-                    "qty": -slice_qty, "fill_price":"", "underlying_price": last,
-                    "target_label": f"TP @ {lvl}", "reason":"touch",
-                    "commission_fee":"", "realized_pnl_$":"", "notes":""
-                })
-                if channel:
-                    await channel.send(f"🎯 **TP Hit** — {slice_qty} closed @ underlying {last:.2f} — Remaining {remaining} — `{trade_id}`")
+                remaining -= slice_qty; positions.set(trade_id,"remaining_qty",remaining)
+                append_partial({"partial_id": f"{trade_id}-{int(time.time())}","trade_id": trade_id, "type":"tp","timestamp": now_iso(),
+                                "qty": -slice_qty, "fill_price":"", "underlying_price": last,"target_label": f"TP @ {lvl}",
+                                "reason":"touch","commission_fee":"", "realized_pnl_$":"", "notes":""})
+                if channel: await channel.send(f"🎯 **TP Hit** — {slice_qty} closed @ underlying {last:.2f} — Remaining {remaining} — `{trade_id}`")
                 tps.remove(tp)
                 if remaining<=0:
                     update_trade_history(trade_id, {"status":"closed","close_time":now_iso(),"underlying_at_close":f"{last:.2f}"})
                     remove_active_trade(trade_id)
-                    if channel: await channel.send(f"📕 **Trade Closed** — `{trade_id}` fully exited.")
-                    return
-
-        # SL by close on timeframe
+                    if channel: await channel.send(f"📕 **Trade Closed** — `{trade_id}` fully exited."); return
         now_ts = time.time(); b = bucket(now_ts)
         if cur_bucket != b:
             if cur_bucket is not None and c is not None and remaining>0:
                 sl_hit = (stop_cond=="close_below" and c < stop_level) or (stop_cond=="close_above" and c > stop_level)
                 if sl_hit:
                     slice_qty = remaining
-                    append_partial({
-                        "partial_id": f"{trade_id}-{int(time.time())}",
-                        "trade_id": trade_id, "type":"stop","timestamp": now_iso(),
-                        "qty": -slice_qty, "fill_price":"", "underlying_price": c,
-                        "target_label": f"SL {stop_cond} {stop_level}", "reason":"close",
-                        "commission_fee":"", "realized_pnl_$":"", "notes":""
-                    })
+                    append_partial({"partial_id": f"{trade_id}-{int(time.time())}","trade_id": trade_id, "type":"stop","timestamp": now_iso(),
+                                    "qty": -slice_qty, "fill_price":"", "underlying_price": c,"target_label": f"SL {stop_cond} {stop_level}",
+                                    "reason":"close","commission_fee":"", "realized_pnl_$":"", "notes":""})
                     positions.set(trade_id,"remaining_qty",0)
                     update_trade_history(trade_id, {"status":"stopped","close_time":now_iso(),"underlying_at_close":f"{c:.2f}"})
                     remove_active_trade(trade_id)
@@ -959,19 +1236,47 @@ async def tp_sl_manager(trade_id:str, parsed:Dict[str,Any], channel: Optional[di
             h=max(h,last); l=min(l,last); c=last
         await asyncio.sleep(1)
 
-# --------------- MAIN ---------------
+# ---------------- UTIL CLOSERS ----------------
+def close_options_by_underlying(underlying: str, type_filter: Optional[str], pct: Optional[int], qty_abs: Optional[int], limit_price: Optional[float]) -> Dict[str, Any]:
+    positions_list = sandbox_list_positions()
+    matched = []
+    for p in positions_list:
+        if p.get("class") != "option": continue
+        if str(p.get("underlying","")).upper() != underlying.upper(): continue
+        opt_type = (p.get("option_type") or "")
+        if not opt_type:
+            opt_type = "call" if p.get("symbol","")[-1:].upper()=="C" else "put"
+        if type_filter and opt_type.lower() != type_filter: continue
+        matched.append(p)
+    if not matched:
+        return {"closed":0,"details":[],"reason":"no_matching_positions"}
+    plan = []; remaining_abs = qty_abs or 0
+    for p in matched:
+        qty = int(abs(int(p.get("quantity",0)))); if_qty = qty <= 0
+        if if_qty: continue
+        if pct is not None: q_close = max(1, (qty * pct)//100)
+        elif qty_abs is not None:
+            q_close = min(qty, remaining_abs); remaining_abs -= q_close
+        else: q_close = qty
+        if q_close <= 0: continue
+        plan.append((p["symbol"], q_close))
+        if qty_abs is not None and remaining_abs <= 0: break
+    closed=0; details=[]
+    for occ, q in plan:
+        if limit_price is not None:
+            resp = sandbox_place_option_order(occ, action="sell_to_close", qty=q, order_type="limit", limit_price=limit_price, duration="day")
+        else:
+            resp = sandbox_place_option_order(occ, action="sell_to_close", qty=q, order_type="market", duration="day")
+        details.append({"occ":occ,"qty":q,"resp":resp}); closed += q
+    return {"closed":closed,"details":details,"reason":"ok"}
+
+# ---------------- MAIN ----------------
 def require_env(k):
     if not os.getenv(k):
         raise SystemExit(f"Missing required env var: {k}")
 
 if __name__ == "__main__":
-    for k in [
-        "DISCORD_TOKEN","OPENAI_API_KEY",
-        "TRADIER_LIVE_API_KEY","TRADIER_SANDBOX_API_KEY","TRADIER_SANDBOX_ACCOUNT_ID",
-        "GOOGLE_SHEET_ID","GOOGLE_SERVICE_ACCOUNT_JSON_TEXT"
-    ]:
+    for k in ["DISCORD_TOKEN","OPENAI_API_KEY","TRADIER_LIVE_API_KEY","TRADIER_SANDBOX_API_KEY","TRADIER_SANDBOX_ACCOUNT_ID",
+              "GOOGLE_SHEET_ID","GOOGLE_SERVICE_ACCOUNT_JSON_TEXT"]:
         require_env(k)
-
-    intents = discord.Intents.default()
-    intents.message_content = True
     bot.run(DISCORD_TOKEN)
