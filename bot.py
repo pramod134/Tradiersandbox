@@ -303,16 +303,140 @@ def parse_alert_to_json(text: str) -> Dict[str,Any]:
     raw = resp.choices[0].message.content.strip()
     return json.loads(raw)
 
+# --- FIXED TOOLS LIST (balanced brackets) ---
 TOOLS = [
-    {"type":"function","function":{"name":"get_positions","description":"Return current account positions; optionally filter by symbols","parameters":{"type":"object","properties":{"symbols":{"type":"array","items":{"type":"string"}}}}}},
-    {"type":"function","function":{"name":"get_orders","description":"Return working/pending orders; optionally filter by symbols","parameters":{"type":"object","properties":{"symbols":{"type":"array","items":{"type":"string"}},"open_only":{"type":"boolean"}}}}},
-    {"type":"function","function":{"name":"close_options","description":"Close specific option positions by OCC symbol list","parameters":{"type":"object","properties":{"occ_symbols":{"type":"array","items":{"type":"string"}},"order_type":{"type":"string","enum":["market","limit"]},"limit":{"type":"number"}},"required":["occ_symbols"]}}},
-    {"type":"function","function":{"name":"get_positions_with_pl","description":"Return positions with avg, live, and pl_pct; optional symbol filter","parameters":{"type":"object","properties":{"symbols":{"type":"array","items":{"type":"string"}}}}}},
-    {"type":"function","function":{"name":"prepare_pending_close","description":"Stash a pending close request (occ list) for confirmation","parameters":{"type":"object","properties":{"occ_symbols":{"type":"array","items":{"type":"string"}},"order_type":{"type":"string","enum":["market","limit"]},"limit":{"type":"number"},"channel_id":{"type":"string"}},"required":["occ_symbols","channel_id"]}}}},
-    {"type":"function","function":{"name":"get_account","description":"Return sandbox account balances and buying power","parameters":{"type":"object","properties":{}}}},
-    {"type":"function","function":{"name":"close_equities","description":"Close equity positions by symbol list (full/percent/qty)","parameters":{"type":"object","properties":{"symbols":{"type":"array","items":{"type":"string"}},"percent":{"type":"integer"},"quantity":{"type":"integer"}},"required":["symbols"]}}}},
-    {"type":"function","function":{"name":"place_equity_order","description":"Place equity market order in sandbox","parameters":{"type":"object","properties":{"symbol":{"type":"string"},"side":{"type":"string","enum":["buy","sell"]},"quantity":{"type":"integer","minimum":1}},"required":["symbol","side","quantity"]}}}},
-    {"type":"function","function":{"name":"place_option_order","description":"Place option order by OCC symbol (market)","parameters":{"type":"object","properties":{"occ_symbol":{"type":"string"},"side":{"type":"string","enum":["buy_to_open","sell_to_open","buy_to_close","sell_to_close"]},"quantity":{"type":"integer","minimum":1}},"required":["occ_symbol","side","quantity"]}}}},
+    {
+        "type":"function",
+        "function":{
+            "name":"get_positions",
+            "description":"Return current account positions; optionally filter by symbols",
+            "parameters":{
+                "type":"object",
+                "properties":{
+                    "symbols":{"type":"array","items":{"type":"string"}}
+                }
+            }
+        }
+    },
+    {
+        "type":"function",
+        "function":{
+            "name":"get_orders",
+            "description":"Return working/pending orders; optionally filter by symbols",
+            "parameters":{
+                "type":"object",
+                "properties":{
+                    "symbols":{"type":"array","items":{"type":"string"}},
+                    "open_only":{"type":"boolean"}
+                }
+            }
+        }
+    },
+    {
+        "type":"function",
+        "function":{
+            "name":"close_options",
+            "description":"Close specific option positions by OCC symbol list",
+            "parameters":{
+                "type":"object",
+                "properties":{
+                    "occ_symbols":{"type":"array","items":{"type":"string"}},
+                    "order_type":{"type":"string","enum":["market","limit"]},
+                    "limit":{"type":"number"}
+                },
+                "required":["occ_symbols"]
+            }
+        }
+    },
+    {
+        "type":"function",
+        "function":{
+            "name":"get_positions_with_pl",
+            "description":"Return positions with avg, live, and pl_pct; optional symbol filter",
+            "parameters":{
+                "type":"object",
+                "properties":{
+                    "symbols":{"type":"array","items":{"type":"string"}}
+                }
+            }
+        }
+    },
+    {
+        "type":"function",
+        "function":{
+            "name":"prepare_pending_close",
+            "description":"Stash a pending close request (occ list) for confirmation",
+            "parameters":{
+                "type":"object",
+                "properties":{
+                    "occ_symbols":{"type":"array","items":{"type":"string"}},
+                    "order_type":{"type":"string","enum":["market","limit"]},
+                    "limit":{"type":"number"},
+                    "channel_id":{"type":"string"}
+                },
+                "required":["occ_symbols","channel_id"]
+            }
+        }
+    },
+    {
+        "type":"function",
+        "function":{
+            "name":"get_account",
+            "description":"Return sandbox account balances and buying power",
+            "parameters":{
+                "type":"object",
+                "properties":{}
+            }
+        }
+    },
+    {
+        "type":"function",
+        "function":{
+            "name":"close_equities",
+            "description":"Close equity positions by symbol list (full/percent/qty)",
+            "parameters":{
+                "type":"object",
+                "properties":{
+                    "symbols":{"type":"array","items":{"type":"string"}},
+                    "percent":{"type":"integer"},
+                    "quantity":{"type":"integer"}
+                },
+                "required":["symbols"]
+            }
+        }
+    },
+    {
+        "type":"function",
+        "function":{
+            "name":"place_equity_order",
+            "description":"Place equity market order in sandbox",
+            "parameters":{
+                "type":"object",
+                "properties":{
+                    "symbol":{"type":"string"},
+                    "side":{"type":"string","enum":["buy","sell"]},
+                    "quantity":{"type":"integer","minimum":1}
+                },
+                "required":["symbol","side","quantity"]
+            }
+        }
+    },
+    {
+        "type":"function",
+        "function":{
+            "name":"place_option_order",
+            "description":"Place option order by OCC symbol (market)",
+            "parameters":{
+                "type":"object",
+                "properties":{
+                    "occ_symbol":{"type":"string"},
+                    "side":{"type":"string","enum":["buy_to_open","sell_to_open","buy_to_close","sell_to_close"]},
+                    "quantity":{"type":"integer","minimum":1}
+                },
+                "required":["occ_symbol","side","quantity"]
+            }
+        }
+    }
 ]
 
 ORCH_SYSTEM = """You are a trading manager for the user’s Tradier SANDBOX account.
@@ -335,7 +459,13 @@ def gpt_orchestrate(user_text: str, channel_id: str) -> str:
     messages.append({"role":"user","content": user_text + f"\n\n[channel_id:{channel_id}]"} )
     max_loops = 6
     for _ in range(max_loops):
-        resp = client.chat.completions.create(model=MODEL_PRIMARY, messages=messages, tools=TOOLS, tool_choice="auto", temperature=0)
+        resp = client.chat.completions.create(
+            model=MODEL_PRIMARY,
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            temperature=0
+        )
         msg = resp.choices[0].message
         if getattr(msg, "tool_calls", None):
             messages.append({"role":"assistant","content": msg.content or "", "tool_calls": msg.tool_calls})
