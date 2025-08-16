@@ -1452,7 +1452,6 @@ except Exception as e:
     if isty:
         tkr = isty["ticker"]; qty = int(isty["qty"]); side = isty["side"]; session = isty["session"]
         last = live_quote(tkr) or 0.0
-        global EXTENDED_STOCK_ENABLED
         prev = EXTENDED_STOCK_ENABLED
         if session == "ETH":
             EXTENDED_STOCK_ENABLED = True
