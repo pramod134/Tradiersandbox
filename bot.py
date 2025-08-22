@@ -658,6 +658,38 @@ def pick_contract(chain: List[Dict[str,Any]], side: str, target_delta: float=0.5
     return min(candidates, key=lambda c: abs(abs(float(c.get("delta",0))) - float(target_delta)))
 
 def sandbox_place_option_order(occ_symbol: str, action: str, qty: int, order_type="market", limit_price=None, duration="day"):
+    # Extract the underlying from the OCC code (letters until first digit)
+    m = re.match(r"^([A-Za-z]+)\d", occ_symbol or "")
+    if not m:
+        raise RuntimeError(f"Bad OCC symbol: {occ_symbol}")
+    underlying = m.group(1).upper()
+
+    h = {"Authorization": f"Bearer {TRADIER_SANDBOX_API_KEY}", "Accept":"application/json"}
+    data = {
+        "class": "option",
+        "symbol": underlying,         # ← underlying ticker (e.g., AMD)
+        "option_symbol": occ_symbol,  # ← full OCC (e.g., AMD250829C00175000)
+        "side": action,
+        "quantity": qty,
+        "type": order_type,
+        "duration": duration
+    }
+    if limit_price is not None:
+        data["price"] = f"{float(limit_price):.2f}"
+
+    url = f"{TRADIER_SANDBOX}/v1/accounts/{TRADIER_SANDBOX_ACCOUNT_ID}/orders"
+    r = requests.post(url, data=data, headers=h, timeout=15)
+    try:
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        raise RuntimeError(f"Tradier order HTTP {r.status_code}: {r.text[:500]}") from e
+    try:
+        return r.json()
+    except Exception:
+        return {"status_code": r.status_code, "raw": r.text[:500]}
+
+
+"""def sandbox_place_option_order(occ_symbol: str, action: str, qty: int, order_type="market", limit_price=None, duration="day"):
     h = {"Authorization": f"Bearer {TRADIER_SANDBOX_API_KEY}", "Accept":"application/json"}
     data = {"class":"option","symbol": occ_symbol,"side": action,"quantity": qty,"type": order_type,"duration": duration}
     if limit_price is not None:
@@ -671,7 +703,7 @@ def sandbox_place_option_order(occ_symbol: str, action: str, qty: int, order_typ
     try:
         return r.json()
     except Exception:
-        return {"status_code": r.status_code, "raw": r.text[:500]}
+        return {"status_code": r.status_code, "raw": r.text[:500]}"""
 
 def sandbox_place_equity_order(symbol: str, side: str, qty: int, last_price: float):
     sess = market_session_ny()
