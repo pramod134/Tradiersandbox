@@ -856,7 +856,75 @@ def sandbox_list_orders_filtered(symbols=None, open_only=True):
         res["details"].append({"occ":occ,"qty":q,"result":r})
     return res"""
 
+_OCC_RE = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")  # e.g., AMD250829C00175000
+
+def _is_occ_symbol(sym: str) -> bool:
+    s = (sym or "").strip().upper()
+    return bool(_OCC_RE.match(s))
+
 def close_options_occ(occ_symbols, order_type="market", limit=None):
+    pos = sandbox_list_positions()
+    print("[DEBUG] Live positions from Tradier:")
+    print(json.dumps(pos, indent=2))
+
+    # Build {OCC -> qty} using OCC pattern (since 'class'/'underlying' can be missing)
+    qty_by_occ = {}
+    for p in pos:
+        sym = (p.get("symbol") or "").strip().upper()
+        if not _is_occ_symbol(sym):
+            continue  # skip equities like SPY/TSLA
+        try:
+            q = int(abs(int(float(p.get("quantity") or 0))))
+        except Exception:
+            q = 0
+        if q > 0:
+            qty_by_occ[sym] = q
+
+    res = {"closed": 0, "details": []}
+    want_occs = [ (occ or "").strip().upper() for occ in (occ_symbols or []) if occ ]
+
+    for req_occ in want_occs:
+        q = qty_by_occ.get(req_occ, 0)
+
+        # Fallback: if exact not found, try same underlying prefix (e.g., "AMD")
+        if q <= 0:
+            m = re.match(r"^([A-Z]+)\d", req_occ)
+            ul = m.group(1) if m else ""
+            if ul:
+                ul_call_occs = [(k, v) for k, v in qty_by_occ.items() if k.startswith(ul) and k.endswith("C")]
+                if len(ul_call_occs) == 1:
+                    occ, q = ul_call_occs[0]
+                    req_occ = occ
+                elif len(ul_call_occs) > 1:
+                    for occ, q2 in ul_call_occs:
+                        if q2 <= 0:
+                            continue
+                        if order_type == "limit" and limit is not None:
+                            r = sandbox_place_option_order(occ, action="sell_to_close", qty=q2,
+                                                           order_type="limit", limit_price=float(limit))
+                        else:
+                            r = sandbox_place_option_order(occ, action="sell_to_close", qty=q2, order_type="market")
+                        res["closed"] += q2
+                        res["details"].append({"occ": occ, "qty": q2, "result": r})
+                    continue
+
+        if q <= 0:
+            res["details"].append({"occ": req_occ, "result": "no_position"})
+            continue
+
+        if order_type == "limit" and limit is not None:
+            r = sandbox_place_option_order(req_occ, action="sell_to_close", qty=q,
+                                           order_type="limit", limit_price=float(limit))
+        else:
+            r = sandbox_place_option_order(req_occ, action="sell_to_close", qty=q, order_type="market")
+
+        res["closed"] += q
+        res["details"].append({"occ": req_occ, "qty": q, "result": r})
+
+    return res
+
+
+"""def close_options_occ(occ_symbols, order_type="market", limit=None):
     pos = sandbox_list_positions()
     print("[DEBUG] Live positions from Tradier:")
     print(json.dumps(pos, indent=2))
@@ -898,7 +966,7 @@ def close_options_occ(occ_symbols, order_type="market", limit=None):
         res["closed"] += q
         res["details"].append({"occ": occ, "qty": q, "result": r})
 
-    return res
+    return res"""
 
 
 def sandbox_list_positions_detailed():
