@@ -689,23 +689,6 @@ def sandbox_place_option_order(occ_symbol: str, action: str, qty: int, order_typ
     except Exception:
         return {"status_code": r.status_code, "raw": r.text[:500]}
 
-
-"""def sandbox_place_option_order(occ_symbol: str, action: str, qty: int, order_type="market", limit_price=None, duration="day"):
-    h = {"Authorization": f"Bearer {TRADIER_SANDBOX_API_KEY}", "Accept":"application/json"}
-    data = {"class":"option","symbol": occ_symbol,"side": action,"quantity": qty,"type": order_type,"duration": duration}
-    if limit_price is not None:
-        data["price"] = f"{float(limit_price):.2f}"
-    url = f"{TRADIER_SANDBOX}/v1/accounts/{TRADIER_SANDBOX_ACCOUNT_ID}/orders"
-    r = requests.post(url, data=data, headers=h, timeout=15)
-    try:
-        r.raise_for_status()
-    except requests.HTTPError as e:
-        raise RuntimeError(f"Tradier order HTTP {r.status_code}: {r.text[:500]}") from e
-    try:
-        return r.json()
-    except Exception:
-        return {"status_code": r.status_code, "raw": r.text[:500]}"""
-
 def sandbox_place_equity_order(symbol: str, side: str, qty: int, last_price: float):
     sess = market_session_ny()
     if sess == "rth" or not EXTENDED_STOCK_ENABLED:
