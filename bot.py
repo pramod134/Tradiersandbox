@@ -858,6 +858,8 @@ def sandbox_list_orders_filtered(symbols=None, open_only=True):
 
 def close_options_occ(occ_symbols, order_type="market", limit=None):
     pos = sandbox_list_positions()
+    print("[DEBUG] Live positions from Tradier:")
+    print(json.dumps(pos, indent=2))
     qty_by_occ = {}
     for p in pos:
         if p.get("class") != "option":
