@@ -757,9 +757,15 @@ def sandbox_list_orders(include_all=False):
 
 def sandbox_list_positions_filtered(symbols=None):
     pos = sandbox_list_positions()
-    if symbols:
+    """if symbols:
         syms = set(s.upper() for s in symbols)
-        pos = [p for p in pos if (p.get("underlying") or p.get("symbol","")).upper() in syms]
+        pos = [p for p in pos if (p.get("underlying") or p.get("symbol","")).upper() in syms]"""
+    
+    if symbols:
+    syms = set(s.upper() for s in symbols)
+    def match(p):
+        return (p.get("underlying") or "").upper() in syms or (p.get("symbol") or "").upper().startswith(tuple(syms))
+    pos = [p for p in pos if match(p)]
     out=[]
     for p in pos:
         cls = (p.get("class") or "").lower()
