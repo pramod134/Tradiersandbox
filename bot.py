@@ -755,17 +755,11 @@ def sandbox_list_orders(include_all=False):
     openish = [o for o in data if str(o.get("status","")).lower() not in final_states]
     return openish
 
-def sandbox_list_positions_filtered(symbols=None):
+"""def sandbox_list_positions_filtered(symbols=None):
     pos = sandbox_list_positions()
-    """if symbols:
-        syms = set(s.upper() for s in symbols)
-        pos = [p for p in pos if (p.get("underlying") or p.get("symbol","")).upper() in syms]"""
-    
     if symbols:
-    syms = set(s.upper() for s in symbols)
-    def match(p):
-        return (p.get("underlying") or "").upper() in syms or (p.get("symbol") or "").upper().startswith(tuple(syms))
-    pos = [p for p in pos if match(p)]
+        syms = set(s.upper() for s in symbols)
+        pos = [p for p in pos if (p.get("underlying") or p.get("symbol","")).upper() in syms]
     out=[]
     for p in pos:
         cls = (p.get("class") or "").lower()
@@ -774,7 +768,37 @@ def sandbox_list_positions_filtered(symbols=None):
         ul  = p.get("underlying") or p.get("symbol")
         exp = p.get("expiry") or infer_expiry_from_occ(sym) if cls=="option" else None
         out.append({"class": cls,"symbol": sym,"underlying": (ul or "").upper(),"quantity": qty,"expiry": exp})
+    return out"""
+
+def sandbox_list_positions_filtered(symbols=None):
+    pos = sandbox_list_positions()
+    if symbols:
+        syms = set(s.upper() for s in symbols)
+
+        def match(p):
+            ul = (p.get("underlying") or "").upper()
+            sym = (p.get("symbol") or "").upper()
+            # Match either the underlying (AMD) or OCC symbol prefix (AMD2508…)
+            return ul in syms or any(sym.startswith(s) for s in syms)
+
+        pos = [p for p in pos if match(p)]
+
+    out = []
+    for p in pos:
+        cls = (p.get("class") or "").lower()
+        qty = int(abs(int(p.get("quantity", 0) or 0)))
+        sym = p.get("symbol")
+        ul = p.get("underlying") or p.get("symbol")
+        exp = p.get("expiry") or infer_expiry_from_occ(sym) if cls == "option" else None
+        out.append({
+            "class": cls,
+            "symbol": sym,
+            "underlying": (ul or "").upper(),
+            "quantity": qty,
+            "expiry": exp
+        })
     return out
+
 
 def infer_expiry_from_occ(occ_symbol: Optional[str]) -> Optional[str]:
     if not occ_symbol:
