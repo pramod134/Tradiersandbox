@@ -775,26 +775,31 @@ def sandbox_list_positions_filtered(symbols=None):
     pos = sandbox_list_positions()
     if symbols:
         syms = set(s.upper() for s in symbols)
-
         def match(p):
             ul = (p.get("underlying") or "").upper()
             sym = (p.get("symbol") or "").upper()
-            # Match either the underlying (AMD) or OCC symbol prefix (AMD2508…)
             return ul in syms or any(sym.startswith(s) for s in syms)
-
         pos = [p for p in pos if match(p)]
 
     out = []
     for p in pos:
-        cls = (p.get("class") or "").lower()
-        qty = int(abs(int(p.get("quantity", 0) or 0)))
-        sym = p.get("symbol")
-        ul = p.get("underlying") or p.get("symbol")
-        exp = p.get("expiry") or infer_expiry_from_occ(sym) if cls == "option" else None
+        sym = (p.get("symbol") or "").strip().upper()
+        qty = int(abs(int(float(p.get("quantity", 0) or 0))))
+        if _is_occ_symbol(sym):
+            # Option contract
+            exp = infer_expiry_from_occ(sym)
+            ul = re.match(r"^([A-Z]+)\d", sym).group(1)
+            cls = "option"
+        else:
+            # Equity
+            exp = None
+            ul = sym
+            cls = "equity"
+
         out.append({
             "class": cls,
             "symbol": sym,
-            "underlying": (ul or "").upper(),
+            "underlying": ul,
             "quantity": qty,
             "expiry": exp
         })
