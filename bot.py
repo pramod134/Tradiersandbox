@@ -498,11 +498,35 @@ def gpt_orchestrate(user_text: str, channel_id: str) -> str:
                         syms_set = set(s.upper() for s in syms)
                         data = [d for d in data if d["underlying"] in syms_set]
                 elif name == "prepare_pending_close":
-                    occs = args["occ_symbols"]; order_type = args.get("order_type","market"); limit_px = args.get("limit")
+                    occs = args.get("occ_symbols", [])      # List of OCC-style option symbols
+                    equities = args.get("symbols", [])      # List of regular equity symbols
+                    order_type = args.get("order_type", "market")
+                    limit_px = args.get("limit")
                     ch = str(args.get("channel_id", channel_id))
-                    PENDING_ACTIONS[ch] = {"ts": time.time(),"occ_symbols": occs,"order_type": order_type,"limit": limit_px}
+                
+                    PENDING_ACTIONS[ch] = {
+                        "ts": time.time(),
+                        "occ_symbols": occs,
+                        "symbols": equities,
+                        "order_type": order_type,
+                        "limit": limit_px
+                    }
+                
                     print(f"[DEBUG] Pending close stored for channel {ch}: {PENDING_ACTIONS[ch]}")
-                    data = {"ok": True, "count": len(occs)}                   
+                
+                    parts = []
+                    if occs:
+                        parts.append(f"• Options: {len(occs)} contract(s)")
+                    if equities:
+                        parts.append(f"• Equities: {', '.join(equities)}")
+                    if not parts:
+                        parts.append("• (Nothing to close)")
+                
+                    await message.channel.send(
+                        "I've prepared to close the following positions:\n" +
+                        "\n".join(parts) + "\n\nPlease type CONFIRM to execute."
+                    )
+                    return
                 elif name == "get_account":
                     data = sandbox_get_account_balances()
                 elif name == "close_equities":
