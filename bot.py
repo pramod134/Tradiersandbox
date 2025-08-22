@@ -521,12 +521,7 @@ def gpt_orchestrate(user_text: str, channel_id: str) -> str:
                         parts.append(f"• Equities: {', '.join(equities)}")
                     if not parts:
                         parts.append("• (Nothing to close)")
-                
-                    await message.channel.send(
-                        "I've prepared to close the following positions:\n" +
-                        "\n".join(parts) + "\n\nPlease type CONFIRM to execute."
-                    )
-                    return
+                    return "I've prepared to close the following positions:\n" + "\n".join(parts) + "\n\nPlease type CONFIRM to execute."
                 elif name == "get_account":
                     data = sandbox_get_account_balances()
                 elif name == "close_equities":
