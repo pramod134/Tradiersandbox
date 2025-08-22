@@ -1540,7 +1540,8 @@ async def on_message(message: discord.Message):
                 ch = str(message.channel.id)
                 pend = PENDING_ACTIONS.get(ch)
                 if not pend:
-                    await message.channel.send("ℹ️ No pending action to confirm.")
+                    result_text = gpt_orchestrate(content, channel_id=ch)
+                    await message.channel.send(result_text)
                     return
                 # Expire confirmations older than 5 minutes
                 if time.time() - pend.get("ts", 0) > 300:
