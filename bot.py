@@ -758,21 +758,6 @@ def sandbox_list_orders(include_all=False):
     openish = [o for o in data if str(o.get("status","")).lower() not in final_states]
     return openish
 
-"""def sandbox_list_positions_filtered(symbols=None):
-    pos = sandbox_list_positions()
-    if symbols:
-        syms = set(s.upper() for s in symbols)
-        pos = [p for p in pos if (p.get("underlying") or p.get("symbol","")).upper() in syms]
-    out=[]
-    for p in pos:
-        cls = (p.get("class") or "").lower()
-        qty = int(abs(int(p.get("quantity",0) or 0)))
-        sym = p.get("symbol")
-        ul  = p.get("underlying") or p.get("symbol")
-        exp = p.get("expiry") or infer_expiry_from_occ(sym) if cls=="option" else None
-        out.append({"class": cls,"symbol": sym,"underlying": (ul or "").upper(),"quantity": qty,"expiry": exp})
-    return out"""
-
 def sandbox_list_positions_filtered(symbols=None):
     pos = sandbox_list_positions()
     if symbols:
@@ -840,29 +825,6 @@ def sandbox_list_orders_filtered(symbols=None, open_only=True):
         })
     return out
 
-"""def close_options_occ(occ_symbols, order_type="market", limit=None):
-    pos = sandbox_list_positions()
-    qty_by_occ = {}
-    for p in pos:
-        if p.get("class")!="option":
-            continue
-        occ = p.get("symbol")
-        if occ in occ_symbols:
-            qty_by_occ[occ] = int(abs(int(p.get("quantity",0) or 0)))
-    res = {"closed":0,"details":[]}
-    for occ in occ_symbols:
-        q = qty_by_occ.get(occ, 0)
-        if q <= 0:
-            res["details"].append({"occ":occ,"result":"no_position"})
-            continue
-        if order_type=="limit" and limit is not None:
-            r = sandbox_place_option_order(occ, action="sell_to_close", qty=q, order_type="limit", limit_price=float(limit))
-        else:
-            r = sandbox_place_option_order(occ, action="sell_to_close", qty=q, order_type="market")
-        res["closed"] += q
-        res["details"].append({"occ":occ,"qty":q,"result":r})
-    return res"""
-
 _OCC_RE = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")  # e.g., AMD250829C00175000
 
 def _is_occ_symbol(sym: str) -> bool:
@@ -929,52 +891,6 @@ def close_options_occ(occ_symbols, order_type="market", limit=None):
         res["details"].append({"occ": req_occ, "qty": q, "result": r})
 
     return res
-
-
-"""def close_options_occ(occ_symbols, order_type="market", limit=None):
-    pos = sandbox_list_positions()
-    print("[DEBUG] Live positions from Tradier:")
-    print(json.dumps(pos, indent=2))
-    qty_by_occ = {}
-    for p in pos:
-        if p.get("class") != "option":
-            continue
-        occ = (p.get("symbol") or "").upper()
-        qty_by_occ[occ] = int(abs(int(p.get("quantity", 0) or 0)))
-
-    res = {"closed": 0, "details": []}
-
-    for occ in occ_symbols:
-        occ = occ.upper()
-        q = qty_by_occ.get(occ, 0)
-
-        # --- NEW: try to match by prefix (underlying ticker) if exact not found ---
-        if q <= 0:
-            for k, v in qty_by_occ.items():
-                if k.startswith(occ[:3]):  # e.g. "AMD"
-                    occ = k
-                    q = v
-                    break
-
-        if q <= 0:
-            res["details"].append({"occ": occ, "result": "no_position"})
-            continue
-
-        if order_type == "limit" and limit is not None:
-            r = sandbox_place_option_order(
-                occ, action="sell_to_close", qty=q,
-                order_type="limit", limit_price=float(limit)
-            )
-        else:
-            r = sandbox_place_option_order(
-                occ, action="sell_to_close", qty=q, order_type="market"
-            )
-
-        res["closed"] += q
-        res["details"].append({"occ": occ, "qty": q, "result": r})
-
-    return res"""
-
 
 def sandbox_list_positions_detailed():
     """Return positions with avg cost (if provided), live price, and PL%."""
