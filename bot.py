@@ -1470,42 +1470,42 @@ async def on_message(message: discord.Message):
     ch = str(message.channel.id)
     lowered = content.lower()
 
-   if lowered in {"confirm", "cancel"}:
-    ch = str(message.channel.id)
-    pend = PENDING_ACTIONS.get(ch)
+       if lowered in {"confirm", "cancel"}:
+        ch = str(message.channel.id)
+        pend = PENDING_ACTIONS.get(ch)
 
-    if lowered == "cancel":
-        if pend:
-            del PENDING_ACTIONS[ch]
-            await message.channel.send("🛑 Pending action canceled.")
-        else:
-            await message.channel.send("ℹ️ No pending action to cancel.")
-        return
+        if lowered == "cancel":
+            if pend:
+                del PENDING_ACTIONS[ch]
+                await message.channel.send("🛑 Pending action canceled.")
+            else:
+                await message.channel.send("ℹ️ No pending action to cancel.")
+            return
 
-    elif lowered == "confirm":
-        if pend and "occ_symbols" in pend and pend["occ_symbols"]:
-            # Execute close logic
-            result = close_options_occ(
-                pend["occ_symbols"],
-                pend.get("order_type", "market"),
-                pend.get("limit")
-            )
-            del PENDING_ACTIONS[ch]
-            closed = result.get("closed", 0)
-            details = result.get("details", [])
-            lines = [f"✅ Confirmed. Closed {closed} contract(s)."]
-            for d in details:
-                occ = d.get("occ")
-                res = d.get("result") or d.get("resp") or "ok"
-                lines.append(f"• {occ} — {res}")
-            await message.channel.send("\n".join(lines))
-            return
-        else:
-            # No close action → interpret as trade rule confirm
-            prev_msg = CHANNEL_HIST[ch][-2]["content"] if len(CHANNEL_HIST[ch]) >= 2 else content
-            result_text = gpt_orchestrate(prev_msg, channel_id=ch)
-            await message.channel.send(result_text)
-            return
+        elif lowered == "confirm":
+            if pend and "occ_symbols" in pend and pend["occ_symbols"]:
+                # Execute close logic
+                result = close_options_occ(
+                    pend["occ_symbols"],
+                    pend.get("order_type", "market"),
+                    pend.get("limit")
+                )
+                del PENDING_ACTIONS[ch]
+                closed = result.get("closed", 0)
+                details = result.get("details", [])
+                lines = [f"✅ Confirmed. Closed {closed} contract(s)."]
+                for d in details:
+                    occ = d.get("occ")
+                    res = d.get("result") or d.get("resp") or "ok"
+                    lines.append(f"• {occ} — {res}")
+                await message.channel.send("\n".join(lines))
+                return
+            else:
+                # No close action → interpret as trade rule confirm
+                prev_msg = CHANNEL_HIST[ch][-2]["content"] if len(CHANNEL_HIST[ch]) >= 2 else content
+                result_text = gpt_orchestrate(prev_msg, channel_id=ch)
+                await message.channel.send(result_text)
+                return
 
 
     # 🧠 For everything else, let GPT orchestrator decide
