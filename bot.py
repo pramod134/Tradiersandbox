@@ -1453,223 +1453,64 @@ async def safe_watch(trade_id, parsed, channel: Optional[discord.TextChannel]):
 
 
 @bot.event
+@bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+
     content = (message.content or "").strip()
     if not content:
         return
 
-    # Allow commands to process first
+    # Let slash + prefix commands run first
     await bot.process_commands(message)
     if content.startswith("!"):
         return
 
+    ch = str(message.channel.id)
     lowered = content.lower()
 
-    # Handle simple ACK/CONFIRM/CANCEL path first
-    simple_ack = lowered
-    if simple_ack in {"yes","y","ok","sure","no","n","cancel","confirm"}:
-        try:
-            if simple_ack == "confirm":
-                ch = str(message.channel.id)
-                pend = PENDING_ACTIONS.get(ch)
-                if not pend:
-                    result_text = gpt_orchestrate(content, channel_id=ch)
-                    await message.channel.send(result_text)
-                    return
-                # Expire confirmations older than 5 minutes
-                if time.time() - pend.get("ts", 0) > 300:
-                    del PENDING_ACTIONS[ch]
-                    await message.channel.send("⌛ The pending action expired. Please re-issue the request.")
-                    return
-                # Execute pending options close
-                if "occ_symbols" in pend:
-                    result = close_options_occ(
-                        pend["occ_symbols"],
-                        pend.get("order_type","market"),
-                        pend.get("limit")
-                    )
-                    del PENDING_ACTIONS[ch]
-                    closed = result.get("closed", 0)
-                    details = result.get("details", [])
-                    lines = [f"✅ Confirmed. Closed {closed} contract(s)."]
-                    for d in details:
-                        occ = d.get("occ")
-                        res = d.get("result") or d.get("resp") or "ok"
-                        lines.append(f"• {occ} — {res}")
-                    await message.channel.send("\n".join(lines))
-                    return
-                else:
-                    del PENDING_ACTIONS[ch]
-                    await message.channel.send("✅ Confirmed. (No actionable pending data found.)")
-                    return
-            elif simple_ack == "cancel":
-                ch = str(message.channel.id)
-                if PENDING_ACTIONS.pop(ch, None):
-                    await message.channel.send("🛑 Pending action canceled.")
-                    return
-                # fall through if nothing pending
-            # For other acks, pass to orchestrator
-            result_text = gpt_orchestrate(content, channel_id=str(message.channel.id))
-            await message.channel.send(result_text)
-            return
-        except Exception as e:
-            print("Orchestrator (ack) error:", e)
-
-    # If we're mid-dialog (assistant asked a question last turn), route reply to the orchestrator
-    try:
-        ch = str(message.channel.id)
-        hist = CHANNEL_HIST[ch]
-        if hist and hist[-1].get("role") == "assistant":
-            result_text = gpt_orchestrate(content, channel_id=ch)
-            await message.channel.send(result_text)
-            return
-    except Exception as e:
-        print("Orchestrator (mid-dialog) error:", e)
-
-    # Heuristic triggers to send to orchestrator
-    orchestrate_triggers = (
-        lowered.startswith(("show ","list ","get ","close ","buy ","sell ","what ","how "))
-        or "balance" in lowered or "profit" in lowered or "p/l" in lowered or "buying power" in lowered
-    )
-    if orchestrate_triggers:
-        try:
-            result_text = gpt_orchestrate(content, channel_id=str(message.channel.id))
-            await message.channel.send(result_text)
-            return
-        except Exception as e:
-            print("Orchestrator error:", e)
-
-    # Quick intent: move SL -> BE
-    msl = try_move_sl_be_intent(content)
-    if msl:
-        matches = find_active_trades_by_contract(msl["ticker"], msl["type"], msl["strike"], msl["expiry"])
-        if not matches:
-            await message.channel.send("ℹ️ No matching active option trade found for that contract.")
-            return
-        count = 0
-        notes = []
-        for a in matches:
-            rownum, header = gs_find_row(TRADES_TAB, "trade_id", a["trade_id"])
-            if rownum:
-                update_trade_history(a["trade_id"], {"notes":"SL→BE"})
-                count += 1
-                notes.append(f"• `{a['trade_id']}` → SL→BE noted")
-        if count == 0:
-            await message.channel.send("⚠️ Could not update trade to BE (trade not found in sheet).")
-            return
-        await message.channel.send("✏️ **SL moved to Break-Even**\n" + "\n".join(notes))
-        return
-
-    # CLOSE OPTIONS (quick intent with confirmation)
-    coi = try_close_option_intent(content)
-    if coi:
-        underlying = coi["ticker"]
-        type_filter = coi["type_filter"]  # "call", "put", or None
-        pct = coi["pct"]
-        qty_abs = coi["qty_abs"]
-        limit_px = coi["limit"]
-
-        positions_list = sandbox_list_positions()
-        matched = []
-        for p in positions_list:
-            if p.get("class") != "option":
-                continue
-            if str(p.get("underlying","")).upper() != underlying.upper():
-                continue
-            opt_type = (p.get("option_type") or "")
-            if not opt_type:
-                opt_type = "call" if (p.get("symbol","")[-1:].upper() == "C") else "put"
-            if type_filter and opt_type.lower() != type_filter:
-                continue
-            matched.append(p)
-
-        if not matched:
-            await message.channel.send(f"ℹ️ No matching option positions found for {underlying}{(' ' + type_filter) if type_filter else ''}.")
-            return
-
-        # Build a plan but do not execute; require confirm
-        plan = []
-        remaining_abs = qty_abs or 0
-        for p in matched:
-            qty = int(abs(int(p.get("quantity", 0))))
-            if qty <= 0:
-                continue
-            if pct is not None:
-                q_close = max(1, (qty * pct)//100)
-            elif qty_abs is not None:
-                q_close = min(qty, remaining_abs)
-                remaining_abs -= q_close
+    if lowered in {"confirm", "cancel"}:
+        pend = PENDING_ACTIONS.get(ch)
+        if lowered == "cancel":
+            if pend:
+                del PENDING_ACTIONS[ch]
+                await message.channel.send("🛑 Pending action canceled.")
             else:
-                q_close = qty
-            if q_close <= 0:
-                continue
-            plan.append((p["symbol"], q_close))
-            if qty_abs is not None and remaining_abs <= 0:
-                break
-
-        if not plan:
-            await message.channel.send(f"ℹ️ Nothing to close for {underlying} based on the requested size.")
+                await message.channel.send("ℹ️ No pending action to cancel.")
             return
+        elif lowered == "confirm":
+            if pend:
+                result = close_options_occ(
+                    pend.get("occ_symbols", []),
+                    pend.get("order_type", "market"),
+                    pend.get("limit")
+                )
+                del PENDING_ACTIONS[ch]
+                closed = result.get("closed", 0)
+                details = result.get("details", [])
+                lines = [f"✅ Confirmed. Closed {closed} contract(s)."]
+                for d in details:
+                    occ = d.get("occ")
+                    res = d.get("result") or d.get("resp") or "ok"
+                    lines.append(f"• {occ} — {res}")
+                await message.channel.send("\n".join(lines))
+                return
+            else:
+                # Confirm without pending close — rerun last message through GPT
+                prev_msg = CHANNEL_HIST[ch][-2]["content"] if len(CHANNEL_HIST[ch]) >= 2 else content
+                result_text = gpt_orchestrate(prev_msg, channel_id=ch)
+                await message.channel.send(result_text)
+                return
 
-        ch = str(message.channel.id)
-        PENDING_ACTIONS[ch] = {
-            "ts": time.time(),
-            "occ_symbols": [occ for occ, _ in plan],
-            "order_type": "limit" if (limit_px is not None) else "market",
-            "limit": limit_px
-        }
-        plan_lines = "\n".join([f"• {occ} — {q}x" for occ, q in plan[:8]])
-        extra = "" if len(plan) <= 8 else f"\n… and {len(plan)-8} more legs"
-        price_note = f" at LIMIT {limit_px:.2f}" if limit_px is not None else " at MARKET"
-        await message.channel.send(
-            f"⚠️ Pending close for **{underlying}** options{(' ('+type_filter+')') if type_filter else ''}{price_note}:\n"
-            f"{plan_lines}{extra}\n"
-            f"Total: {sum(q for _, q in plan)} contract(s). Type **confirm** to execute or **cancel**."
-        )
-        return
+    # 🧠 For everything else, let GPT orchestrator decide
+    try:
+        result_text = gpt_orchestrate(content, channel_id=ch)
+        await message.channel.send(result_text)
+    except Exception as e:
+        print("GPT orchestrator failed:", e)
+        await message.channel.send("⚠️ Could not process that request.")
 
-    # CLOSE STOCK (quick intent)
-    csi = try_close_stock_intent(content)
-    if csi:
-        tkr = csi["ticker"]; pct = csi["pct"]; qty_abs = csi["qty_abs"]
-        res = close_equities_by_symbol([tkr], pct=pct, qty_abs=qty_abs)
-        if res["closed"] <= 0:
-            await message.channel.send(f"ℹ️ No {tkr} shares to sell (position not found or zero qty).")
-            return
-        qty_txt = "ALL" if (pct==100 and qty_abs is None) else (f"{pct}%" if pct is not None else f"{qty_abs}")
-        lines = [f"✅ Sold {qty_txt} of **{tkr}**:"]
-        for d in res["details"]:
-            lines.append(f"• {d['symbol']}: sold {d['qty']} shares @ market")
-        await message.channel.send("\n".join(lines))
-        return
-
-    # IMMEDIATE STOCK (quick intent)
-    isty = try_immediate_stock_intent(content)
-    if isty:
-        tkr = isty["ticker"]; qty = int(isty["qty"]); side = isty["side"]; session = isty["session"]
-        last = live_quote(tkr) or 0.0
-        prev = EXTENDED_STOCK_ENABLED
-        if session == "ETH":
-            # temporarily enable extended-hours behavior for this one order
-            globals()['EXTENDED_STOCK_ENABLED'] = True
-        try:
-            resp = sandbox_place_equity_order(tkr, side, qty, float(last))
-        except Exception as e:
-            await message.channel.send(f"⚠️ Equity order error: {e}")
-            return
-        finally:
-            globals()['EXTENDED_STOCK_ENABLED'] = prev
-        trade_id = f"{tkr}-{datetime.utcnow().strftime('%Y%m%d')}-{int(time.time())%100000:05d}"
-        append_trade_history({
-            "trade_id": trade_id, "source":"Discord", "ticker":tkr,
-            "asset_type":"stock", "side": ("long" if side=="buy" else "short"),
-            "contract": f"{tkr} shares","qty_total": qty, "status":"active", "entry_time": now_iso(),
-            "entry_price":"", "underlying_at_entry": f"{last:.2f}"
-        })
-        await message.channel.send(f"✅ Placed {side.upper()} order: {qty} {tkr} @ ~{last:.2f}\nTrade ID: `{trade_id}`")
-        return
 def require_env(k):
     if not os.getenv(k):
         raise SystemExit(f"Missing required env var: {k}")
