@@ -1469,6 +1469,7 @@ async def on_message(message: discord.Message):
     ch = str(message.channel.id)
     lowered = content.lower()
 
+    # Handle CONFIRM / CANCEL
     if lowered in {"confirm", "cancel"}:
         pend = PENDING_ACTIONS.get(ch)
 
@@ -1505,7 +1506,7 @@ async def on_message(message: discord.Message):
                 await message.channel.send(result_text)
                 return
 
-    # If message is part of an ongoing dialog, route to orchestrator
+    # Mid-dialog follow-up (if bot asked a question)
     try:
         hist = CHANNEL_HIST[ch]
         if hist and hist[-1].get("role") == "assistant":
@@ -1515,9 +1516,9 @@ async def on_message(message: discord.Message):
     except Exception as e:
         print("Orchestrator (mid-dialog) error:", e)
 
-    # Trigger GPT if message looks like a trade or question
+    # Heuristic triggers (common trading intent)
     orchestrate_triggers = (
-        lowered.startswith(("show ","list ","get ","close ","buy ","sell ","what ","how "))
+        lowered.startswith(("show ", "list ", "get ", "close ", "buy ", "sell ", "what ", "how "))
         or "balance" in lowered or "profit" in lowered or "p/l" in lowered or "buying power" in lowered
     )
     if orchestrate_triggers:
@@ -1527,6 +1528,13 @@ async def on_message(message: discord.Message):
             return
         except Exception as e:
             print("Orchestrator error:", e)
+
+    # FINAL fallback — route all unmatched messages to GPT
+    try:
+        result_text = gpt_orchestrate(content, channel_id=ch)
+        await message.channel.send(result_text)
+    except Exception as e:
+        print("Final fallback orchestrator error:", e)
 
 
 def require_env(k):
