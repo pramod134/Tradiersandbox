@@ -1453,7 +1453,6 @@ async def safe_watch(trade_id, parsed, channel: Optional[discord.TextChannel]):
 
 
 @bot.event
-@bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
@@ -1470,8 +1469,7 @@ async def on_message(message: discord.Message):
     ch = str(message.channel.id)
     lowered = content.lower()
 
-       if lowered in {"confirm", "cancel"}:
-        ch = str(message.channel.id)
+    if lowered in {"confirm", "cancel"}:
         pend = PENDING_ACTIONS.get(ch)
 
         if lowered == "cancel":
@@ -1507,14 +1505,29 @@ async def on_message(message: discord.Message):
                 await message.channel.send(result_text)
                 return
 
-
-    # 🧠 For everything else, let GPT orchestrator decide
+    # If message is part of an ongoing dialog, route to orchestrator
     try:
-        result_text = gpt_orchestrate(content, channel_id=ch)
-        await message.channel.send(result_text)
+        hist = CHANNEL_HIST[ch]
+        if hist and hist[-1].get("role") == "assistant":
+            result_text = gpt_orchestrate(content, channel_id=ch)
+            await message.channel.send(result_text)
+            return
     except Exception as e:
-        print("GPT orchestrator failed:", e)
-        await message.channel.send("⚠️ Could not process that request.")
+        print("Orchestrator (mid-dialog) error:", e)
+
+    # Trigger GPT if message looks like a trade or question
+    orchestrate_triggers = (
+        lowered.startswith(("show ","list ","get ","close ","buy ","sell ","what ","how "))
+        or "balance" in lowered or "profit" in lowered or "p/l" in lowered or "buying power" in lowered
+    )
+    if orchestrate_triggers:
+        try:
+            result_text = gpt_orchestrate(content, channel_id=ch)
+            await message.channel.send(result_text)
+            return
+        except Exception as e:
+            print("Orchestrator error:", e)
+
 
 def require_env(k):
     if not os.getenv(k):
